@@ -1,0 +1,10 @@
+__pycache__/
+*.pyc
+*.pyo
+*.log
+*.jsonl
+data/*/
+!data/.gitkeep
+audio/*.wav
+venv/
+.env
