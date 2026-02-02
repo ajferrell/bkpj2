@@ -1,6 +1,8 @@
 """
 EPUB Ambience Orchestrator (v1)
 Main entry point and orchestration logic.
+
+Updated to support exact CFI-to-chunk mapping via Calibre's CFI parser.
 """
 
 import argparse
@@ -13,9 +15,77 @@ from typing import Optional
 from audio_engine import AudioEngine
 from controller import Controller
 from watcher import CalibreWatcher
-from resolver import CFIResolver
+from resolver_calibre import CalibreCFIResolver
 from logger import OrchestratorLogger
 from preprocessor import preprocess_epub
+
+
+def find_timeline_for_calibre_id(calibre_id: str, data_dir: Path, book_id_mapping: dict) -> Optional[Path]:
+    """
+    Find the timeline.json for a Calibre annotation ID.
+    
+    Search order:
+    1. Check book_id_mapping in config
+    2. Search all timelines for matching calibre_id field
+    3. Try calibre_id as direct book_id
+    
+    Returns the timeline path if found, None otherwise.
+    """
+    # 1. Check explicit mapping
+    if calibre_id in book_id_mapping:
+        mapped_id = book_id_mapping[calibre_id]
+        timeline_path = data_dir / mapped_id / "timeline.json"
+        if timeline_path.exists():
+            return timeline_path
+    
+    # 2. Search all timelines for calibre_id field
+    if data_dir.exists():
+        for subdir in data_dir.iterdir():
+            if subdir.is_dir():
+                timeline_path = subdir / "timeline.json"
+                if timeline_path.exists():
+                    try:
+                        with open(timeline_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        # Check if this timeline has a calibre_id that matches
+                        if data.get('calibre_id') == calibre_id:
+                            return timeline_path
+                    except Exception:
+                        continue
+    
+    # 3. Try calibre_id as direct book_id
+    timeline_path = data_dir / calibre_id / "timeline.json"
+    if timeline_path.exists():
+        return timeline_path
+    
+    return None
+
+
+def link_calibre_to_book(calibre_id: str, book_id: str, data_dir: Path) -> bool:
+    """
+    Link a Calibre annotation ID to a preprocessed book by storing it in timeline.
+    
+    Returns True if successful.
+    """
+    timeline_path = data_dir / book_id / "timeline.json"
+    if not timeline_path.exists():
+        print(f"Error: No timeline found for book_id '{book_id}'")
+        return False
+    
+    try:
+        with open(timeline_path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+        
+        data['calibre_id'] = calibre_id
+        
+        with open(timeline_path, 'w', encoding='utf-8') as f:
+            json.dump(data, f, indent=2, ensure_ascii=False)
+        
+        print(f"Linked Calibre ID '{calibre_id}' to book '{book_id}'")
+        return True
+    except Exception as e:
+        print(f"Error linking: {e}")
+        return False
 
 
 class Orchestrator:
@@ -33,7 +103,7 @@ class Orchestrator:
         self.audio_engine: Optional[AudioEngine] = None
         self.controller: Optional[Controller] = None
         self.watcher: Optional[CalibreWatcher] = None
-        self.resolver: Optional[CFIResolver] = None
+        self.resolver: Optional[CalibreCFIResolver] = None
         
         # Scene list
         self.scene_list = list(self.config['scene_bins'].keys())
@@ -148,31 +218,50 @@ class Orchestrator:
                 position = self.watcher.poll()
                 
                 if position:
-                    new_book_id = position['book_id']
+                    calibre_id = position['book_id']  # This is Calibre's internal hash
                     epubcfi = position['epubcfi']
                     
-                    # Map Calibre hash to actual book ID if configured
+                    # Find timeline for this Calibre ID
                     book_id_mapping = self.config.get('book_id_mapping', {})
-                    mapped_book_id = book_id_mapping.get(new_book_id, new_book_id)
+                    timeline_path = find_timeline_for_calibre_id(
+                        calibre_id, 
+                        Path("data"), 
+                        book_id_mapping
+                    )
+                    
+                    if timeline_path is None:
+                        if calibre_id != current_book_id:  # Only warn once per book
+                            self.logger.print_message(
+                                f"\nNo timeline found for Calibre ID: {calibre_id[:16]}...\n"
+                                f"  To link: python main.py link {calibre_id} <book_id>\n"
+                                f"  Or preprocess the EPUB first: python main.py preprocess <epub_path>"
+                            )
+                            current_book_id = calibre_id
+                        continue
+                    
+                    # Get book_id from timeline
+                    with open(timeline_path, 'r', encoding='utf-8') as f:
+                        timeline_data = json.load(f)
+                    book_id = timeline_data.get('book_id', 'unknown')
                     
                     # Check if book changed
-                    if mapped_book_id != current_book_id:
-                        self.logger.print_message(f"\nSwitched to book: {mapped_book_id} (Calibre: {new_book_id[:16]}...)")
-                        current_book_id = mapped_book_id
+                    if book_id != current_book_id:
+                        self.logger.print_message(f"\nSwitched to book: {book_id} (Calibre: {calibre_id[:16]}...)")
+                        current_book_id = book_id
                         
-                        # Load timeline for this book
-                        timeline_path = Path("data") / mapped_book_id / "timeline.json"
+                        epub_path = timeline_data.get('epub_path')
                         
-                        if not timeline_path.exists():
-                            self.logger.print_message(
-                                f"Warning: No timeline found for '{mapped_book_id}'. "
-                                f"Run: python main.py preprocess <epub_path>"
-                            )
+                        if not epub_path or not Path(epub_path).exists():
+                            self.logger.print_message(f"Warning: EPUB not found: {epub_path}")
                             current_book_id = None
                             continue
                         
-                        # Initialize resolver
-                        self.resolver = CFIResolver(str(timeline_path))
+                        # Auto-link Calibre ID to this book for future lookups
+                        if timeline_data.get('calibre_id') != calibre_id:
+                            link_calibre_to_book(calibre_id, book_id, Path("data"))
+                        
+                        # Initialize exact CFI resolver (uses Calibre's parser)
+                        self.resolver = CalibreCFIResolver(epub_path, str(timeline_path))
                         
                         # Initialize controller
                         self.controller = Controller(
@@ -181,13 +270,16 @@ class Orchestrator:
                             logger=self.logger
                         )
                         
-                        self.logger.update_status(book_id=new_book_id)
+                        self.logger.update_status(book_id=calibre_id)
                     
-                    # Resolve CFI to chunk
+                    # Resolve CFI to chunk using exact resolver
                     if self.resolver:
-                        chunk_id, confidence = self.resolver.resolve(epubcfi)
+                        result = self.resolver.resolve(epubcfi)
                         
-                        if chunk_id is not None:
+                        if result is not None:
+                            chunk_id = result.chunk_id
+                            confidence = result.confidence
+                            
                             # Update controller
                             target_scene = self.controller.update(
                                 chunk_id=chunk_id,
@@ -221,24 +313,28 @@ def main():
 Commands:
   preprocess <epub_path>    Preprocess an EPUB file
   run [--dummy]             Run the orchestrator
+  link <calibre_id> <book_id>  Link Calibre annots ID to a book
+  list                      List all preprocessed books
 
 Examples:
   python main.py preprocess mybook.epub
   python main.py run
   python main.py run --dummy
+  python main.py link abc123def B0C5S477SF
+  python main.py list
         """
     )
     
     parser.add_argument(
         'command',
-        choices=['preprocess', 'run'],
+        choices=['preprocess', 'run', 'link', 'list'],
         help='Command to execute'
     )
     
     parser.add_argument(
-        'epub_path',
-        nargs='?',
-        help='Path to EPUB file (for preprocess command)'
+        'args',
+        nargs='*',
+        help='Command arguments'
     )
     
     parser.add_argument(
@@ -264,14 +360,57 @@ Examples:
     
     # Execute command
     if args.command == 'preprocess':
-        if not args.epub_path:
+        if not args.args:
             print("Error: epub_path required for preprocess command")
-            parser.print_help()
+            print("Usage: python main.py preprocess <epub_path>")
             sys.exit(1)
         
-        print(f"Preprocessing: {args.epub_path}\n")
-        timeline_path = preprocess_epub(args.epub_path)
+        epub_path = args.args[0]
+        print(f"Preprocessing: {epub_path}\n")
+        timeline_path = preprocess_epub(epub_path)
         print(f"\nDone! Timeline saved to: {timeline_path}")
+    
+    elif args.command == 'link':
+        if len(args.args) < 2:
+            print("Error: calibre_id and book_id required for link command")
+            print("Usage: python main.py link <calibre_id> <book_id>")
+            print("\nTo find your Calibre ID, run the orchestrator and it will show")
+            print("the ID when it detects a book without a linked timeline.")
+            sys.exit(1)
+        
+        calibre_id = args.args[0]
+        book_id = args.args[1]
+        
+        if link_calibre_to_book(calibre_id, book_id, Path("data")):
+            print(f"\nSuccess! Calibre ID '{calibre_id}' is now linked to book '{book_id}'")
+        else:
+            sys.exit(1)
+    
+    elif args.command == 'list':
+        data_dir = Path("data")
+        if not data_dir.exists():
+            print("No preprocessed books found (data/ directory doesn't exist)")
+            sys.exit(0)
+        
+        print("\nPreprocessed books:\n")
+        for subdir in sorted(data_dir.iterdir()):
+            if subdir.is_dir():
+                timeline_path = subdir / "timeline.json"
+                if timeline_path.exists():
+                    try:
+                        with open(timeline_path, 'r', encoding='utf-8') as f:
+                            data = json.load(f)
+                        book_id = data.get('book_id', subdir.name)
+                        calibre_id = data.get('calibre_id', '(not linked)')
+                        epub_path = data.get('epub_path', '?')
+                        chunks = data.get('total_chunks', '?')
+                        print(f"  {book_id}")
+                        print(f"    Calibre ID: {calibre_id}")
+                        print(f"    Chunks: {chunks}")
+                        print(f"    EPUB: {epub_path}")
+                        print()
+                    except Exception as e:
+                        print(f"  {subdir.name}: (error reading timeline: {e})")
     
     elif args.command == 'run':
         orchestrator = Orchestrator(config_path=args.config)

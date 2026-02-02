@@ -1,21 +1,28 @@
 """
 EPUB preprocessor: extract canonical text and build chunk timeline.
+
+Updated to support exact CFI-to-chunk mapping with global char offsets.
 """
 
 import json
 import re
 import unicodedata
 from pathlib import Path
-from typing import List, Dict
+from typing import List, Dict, Tuple, Optional
 from xml.etree import ElementTree as ET
 
 from ebooklib import epub
 from ebooklib import ITEM_DOCUMENT
 
+from canonicalize import canonicalize_xhtml, compute_sha256
+
 
 class EPUBPreprocessor:
     """
     Preprocesses EPUB files to extract canonical text and create chunks.
+    
+    Builds a single global canonical text stream by concatenating spine docs,
+    then chunks over that with global char offsets for exact CFI resolution.
     """
     
     def __init__(self, epub_path: str, output_dir: str = "data"):
@@ -28,7 +35,7 @@ class EPUBPreprocessor:
         self.min_chunk_words = 250
         self.max_chunk_words = 400
     
-    def process(self):
+    def process(self) -> Path:
         """Main processing pipeline."""
         print(f"Processing EPUB: {self.epub_path}")
         
@@ -43,19 +50,21 @@ class EPUBPreprocessor:
         book_dir = self.output_dir / self.book_id
         book_dir.mkdir(parents=True, exist_ok=True)
         
-        # Extract canonical text from spine
-        spine_texts = self._extract_spine_texts()
-        print(f"Extracted {len(spine_texts)} spine items")
+        # Extract spine documents with global offsets
+        spine_entries, global_text = self._extract_spine_with_global_offsets()
+        print(f"Extracted {len(spine_entries)} spine items, {len(global_text)} chars total")
         
-        # Build chunks
-        chunks = self._build_chunks(spine_texts)
+        # Build chunks with global offsets
+        chunks = self._build_chunks_global(spine_entries, global_text)
         print(f"Created {len(chunks)} chunks")
         
-        # Save timeline
+        # Save timeline with new format
         timeline = {
             "book_id": self.book_id,
             "epub_path": str(self.epub_path),
+            "total_chars": len(global_text),
             "total_chunks": len(chunks),
+            "spine": spine_entries,
             "chunks": chunks
         }
         
@@ -81,177 +90,98 @@ class EPUBPreprocessor:
         # Fallback to filename
         return self.epub_path.stem
     
-    def _extract_spine_texts(self) -> List[Dict]:
+    def _extract_spine_with_global_offsets(self) -> Tuple[List[Dict], str]:
         """
-        Extract canonical text from all spine items.
-        Returns a list of {spine_id, text, item_href}.
-        """
-        spine_texts = []
+        Extract canonical text from all spine items and build global text stream.
         
-        # Get spine items
+        Returns:
+            (spine_entries, global_text)
+            
+        spine_entries is a list of dicts:
+            {
+                'spine_index': int,
+                'href': str,
+                'global_start_char': int,
+                'canonical_len': int,
+                'sha256': str
+            }
+        """
+        spine_entries = []
+        global_text_parts = []
+        global_offset = 0
+        
         spine = self.book.spine
         
-        for spine_id, (item_id, linear) in enumerate(spine):
-            # Get item
+        for spine_index, (item_id, linear) in enumerate(spine):
             item = self.book.get_item_with_id(item_id)
             
             if item is None:
                 continue
             
-            # Extract text from XHTML
             try:
                 content = item.get_content()
-                text = self._extract_text_from_xhtml(content)
+                canonical_text = canonicalize_xhtml(content)
+                canonical_len = len(canonical_text)
+                text_hash = compute_sha256(canonical_text)
                 
-                spine_texts.append({
-                    'spine_id': spine_id,
-                    'text': text,
-                    'item_href': item.get_name()
+                spine_entries.append({
+                    'spine_index': spine_index,
+                    'href': item.get_name(),
+                    'global_start_char': global_offset,
+                    'canonical_len': canonical_len,
+                    'sha256': text_hash
                 })
-            
+                
+                global_text_parts.append(canonical_text)
+                global_offset += canonical_len
+                
+                # Add separator between spine docs (double newline for paragraph break)
+                if canonical_len > 0:
+                    global_text_parts.append('\n\n')
+                    global_offset += 2
+                
             except Exception as e:
-                print(f"Warning: Failed to extract text from spine {spine_id}: {e}")
+                print(f"Warning: Failed to extract text from spine {spine_index}: {e}")
         
-        return spine_texts
+        global_text = ''.join(global_text_parts)
+        return spine_entries, global_text
     
-    def _extract_text_from_xhtml(self, content: bytes) -> str:
+    def _build_chunks_global(self, spine_entries: List[Dict], global_text: str) -> List[Dict]:
         """
-        Extract canonical text from XHTML content.
-        - Strip scripts, styles, nav
-        - Normalize whitespace
-        - Preserve paragraph boundaries
-        - Unicode normalize
-        """
-        try:
-            # Parse XHTML, removing namespaces for easier processing
-            root = ET.fromstring(content)
-            self._strip_namespaces(root)
-            
-            # Remove unwanted elements
-            self._remove_elements(root, ['script', 'style', 'nav', 'meta', 'link'])
-            
-            # Extract text
-            text = self._extract_text_recursive(root)
-            
-            # Normalize
-            text = self._normalize_text(text)
-            
-            return text
-        
-        except ET.ParseError as e:
-            print(f"Warning: XML parse error: {e}")
-            # Fallback: crude text extraction
-            text = content.decode('utf-8', errors='ignore')
-            text = re.sub(r'<[^>]+>', ' ', text)
-            return self._normalize_text(text)
-    
-    def _strip_namespaces(self, elem):
-        """Remove namespaces from all elements."""
-        if '}' in elem.tag:
-            elem.tag = elem.tag.split('}', 1)[1]
-        
-        for child in elem:
-            self._strip_namespaces(child)
-    
-    def _remove_elements(self, root, tag_names: List[str]):
-        """Remove elements by tag name (no namespace)."""
-        for tag in tag_names:
-            for elem in root.findall(f'.//{tag}'):
-                parent = root.find(f'.//{tag}/..')
-                if parent is None:
-                    # Try direct iteration
-                    for p in root.iter():
-                        if elem in list(p):
-                            p.remove(elem)
-                            break
-                else:
-                    parent.remove(elem)
-    
-    def _extract_text_recursive(self, element, paragraphs: List[str] = None) -> str:
-        """
-        Recursively extract text, preserving paragraph boundaries.
-        """
-        if paragraphs is None:
-            paragraphs = []
-        
-        # Block-level elements that indicate paragraph boundaries
-        block_tags = {'p', 'div', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'li', 'blockquote', 'section', 'article'}
-        
-        # Get tag name (already stripped of namespace)
-        tag = element.tag.lower() if element.tag else ''
-        
-        # Collect text from this element and children
-        parts = []
-        
-        if element.text:
-            parts.append(element.text)
-        
-        for child in element:
-            child_text = self._extract_text_recursive(child, None)
-            if child_text:
-                parts.append(child_text)
-            
-            if child.tail:
-                parts.append(child.tail)
-        
-        text = ' '.join(parts).strip()
-        
-        # Add to paragraphs if block-level
-        if tag in block_tags and text:
-            paragraphs.append(text)
-            return '\n\n'.join(paragraphs)
-        
-        return text
-    
-    def _normalize_text(self, text: str) -> str:
-        """
-        Normalize text:
-        - Unicode normalize (NFC)
-        - Collapse multiple whitespace
-        - Preserve paragraph breaks (double newline)
-        """
-        # Unicode normalize
-        text = unicodedata.normalize('NFC', text)
-        
-        # Split into paragraphs
-        paragraphs = re.split(r'\n\s*\n', text)
-        
-        # Normalize each paragraph
-        normalized = []
-        for para in paragraphs:
-            # Collapse whitespace
-            para = re.sub(r'\s+', ' ', para)
-            para = para.strip()
-            
-            if para:
-                normalized.append(para)
-        
-        # Rejoin with double newline
-        return '\n\n'.join(normalized)
-    
-    def _build_chunks(self, spine_texts: List[Dict]) -> List[Dict]:
-        """
-        Build chunks from spine texts.
+        Build chunks from global text with global char offsets.
         Each chunk is 250-400 words, never splitting paragraphs.
+        Respects spine/chapter boundaries.
         """
         chunks = []
         chunk_id = 0
         
-        for spine_item in spine_texts:
-            spine_id = spine_item['spine_id']
-            text = spine_item['text']
+        # Process each spine document separately to respect chapter boundaries
+        for spine_entry in spine_entries:
+            spine_index = spine_entry['spine_index']
+            spine_start = spine_entry['global_start_char']
+            spine_len = spine_entry['canonical_len']
+            
+            if spine_len == 0:
+                continue
+            
+            # Extract this spine's text from global text
+            spine_text = global_text[spine_start:spine_start + spine_len]
             
             # Split into paragraphs
-            paragraphs = text.split('\n\n')
+            paragraphs = spine_text.split('\n\n')
             
-            # Build chunks
-            current_chunk = []
+            # Build chunks for this spine
+            current_chunk_paragraphs = []
             current_word_count = 0
-            current_start_char = 0
+            current_start_local = 0  # Local offset within spine
+            local_offset = 0  # Tracks current position in spine text
             
             for para in paragraphs:
                 para = para.strip()
+                para_len = len(para) + 2  # +2 for paragraph separator
+                
                 if not para:
+                    local_offset += 2  # Empty paragraph separator
                     continue
                 
                 para_words = len(para.split())
@@ -260,42 +190,68 @@ class EPUBPreprocessor:
                 if current_word_count > 0 and current_word_count + para_words > self.max_chunk_words:
                     # Finalize current chunk (if it meets minimum)
                     if current_word_count >= self.min_chunk_words:
-                        chunk_text = '\n\n'.join(current_chunk)
-                        end_char = current_start_char + len(chunk_text)
+                        chunk_text = '\n\n'.join(current_chunk_paragraphs)
+                        start_global = spine_start + current_start_local
+                        end_global = start_global + len(chunk_text)
                         
                         chunks.append({
                             'chunk_id': chunk_id,
-                            'spine_id': spine_id,
-                            'start_char': current_start_char,
-                            'end_char': end_char,
+                            'start_char_global': start_global,
+                            'end_char_global': end_global,
+                            'start_doc_spine_index': spine_index,
                             'word_count': current_word_count,
                             'text_preview': chunk_text[:100] + '...' if len(chunk_text) > 100 else chunk_text
                         })
                         
                         chunk_id += 1
-                        current_start_char = end_char + 2  # +2 for paragraph break
-                        current_chunk = []
+                        current_start_local = local_offset
+                        current_chunk_paragraphs = []
                         current_word_count = 0
                 
                 # Add paragraph to current chunk
-                current_chunk.append(para)
+                current_chunk_paragraphs.append(para)
                 current_word_count += para_words
+                local_offset += para_len
             
-            # Finalize remaining chunk
-            if current_chunk and current_word_count >= self.min_chunk_words:
-                chunk_text = '\n\n'.join(current_chunk)
-                end_char = current_start_char + len(chunk_text)
+            # Finalize remaining chunk for this spine
+            if current_chunk_paragraphs and current_word_count >= self.min_chunk_words:
+                chunk_text = '\n\n'.join(current_chunk_paragraphs)
+                start_global = spine_start + current_start_local
+                end_global = start_global + len(chunk_text)
                 
                 chunks.append({
                     'chunk_id': chunk_id,
-                    'spine_id': spine_id,
-                    'start_char': current_start_char,
-                    'end_char': end_char,
+                    'start_char_global': start_global,
+                    'end_char_global': end_global,
+                    'start_doc_spine_index': spine_index,
                     'word_count': current_word_count,
                     'text_preview': chunk_text[:100] + '...' if len(chunk_text) > 100 else chunk_text
                 })
                 
                 chunk_id += 1
+            elif current_chunk_paragraphs:
+                # Small final chunk - merge with previous if possible
+                if chunks and chunks[-1].get('start_doc_spine_index') == spine_index:
+                    # Merge with previous chunk
+                    chunk_text = '\n\n'.join(current_chunk_paragraphs)
+                    chunks[-1]['end_char_global'] = spine_start + current_start_local + len(chunk_text)
+                    chunks[-1]['word_count'] += current_word_count
+                else:
+                    # Create small chunk anyway
+                    chunk_text = '\n\n'.join(current_chunk_paragraphs)
+                    start_global = spine_start + current_start_local
+                    end_global = start_global + len(chunk_text)
+                    
+                    chunks.append({
+                        'chunk_id': chunk_id,
+                        'start_char_global': start_global,
+                        'end_char_global': end_global,
+                        'start_doc_spine_index': spine_index,
+                        'word_count': current_word_count,
+                        'text_preview': chunk_text[:100] + '...' if len(chunk_text) > 100 else chunk_text
+                    })
+                    
+                    chunk_id += 1
         
         return chunks
 
