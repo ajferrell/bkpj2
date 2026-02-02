@@ -13,7 +13,7 @@ import logging
 from pathlib import Path
 from typing import Optional, Dict, Any
 
-from resolver_calibre import CalibreCFIResolver
+from .resolver_calibre import CalibreCFIResolver
 
 
 logger = logging.getLogger(__name__)

@@ -5,7 +5,7 @@ Controller: state machine and anti-thrash logic.
 import time
 from enum import Enum
 from typing import Optional, List
-from logger import OrchestratorLogger
+from .logger import OrchestratorLogger
 
 
 class ControllerState(Enum):
@@ -43,12 +43,17 @@ class Controller:
         self.state = ControllerState.IDLE
         self.current_scene: Optional[str] = None
         self.target_scene: Optional[str] = None
+        self.total_chunks: Optional[int] = None  # For % display
         
         # Anti-thrash tracking
         self.chunk_history: List[int] = []
         self.last_switch_time = 0.0
         self.consecutive_count = 0
         self.last_chunk_id: Optional[int] = None
+    
+    def set_total_chunks(self, total: int):
+        """Set total chunks for percentage display."""
+        self.total_chunks = total
     
     def update(
         self,
@@ -151,6 +156,7 @@ class Controller:
             self.logger.update_status(
                 book_id=book_id,
                 chunk_id=chunk_id,
+                total_chunks=self.total_chunks,
                 scene=target_scene,
                 active_bin=target_scene,
                 confidence=confidence
@@ -172,6 +178,7 @@ class Controller:
         self.logger.update_status(
             book_id=book_id,
             chunk_id=chunk_id,
+            total_chunks=self.total_chunks,
             scene=target_scene,
             confidence=confidence
         )
@@ -198,6 +205,7 @@ class Controller:
             self.logger.update_status(
                 book_id=book_id,
                 chunk_id=chunk_id,
+                total_chunks=self.total_chunks,
                 scene=target_scene,
                 active_bin=target_scene,
                 confidence=confidence
@@ -209,6 +217,7 @@ class Controller:
         self.logger.update_status(
             book_id=book_id,
             chunk_id=chunk_id,
+            total_chunks=self.total_chunks,
             scene=target_scene,
             confidence=confidence
         )
@@ -226,6 +235,7 @@ class Controller:
         self.logger.update_status(
             book_id=book_id,
             chunk_id=chunk_id,
+            total_chunks=self.total_chunks,
             scene=target_scene,
             active_bin=self.current_scene,
             dwell_remaining=dwell_remaining,
@@ -252,6 +262,7 @@ class Controller:
                     self.logger.update_status(
                         book_id=book_id,
                         chunk_id=chunk_id,
+                        total_chunks=self.total_chunks,
                         scene=target_scene,
                         active_bin=target_scene,
                         dwell_remaining=self.dwell_time_sec,
@@ -321,6 +332,7 @@ class Controller:
             self.logger.update_status(
                 book_id=book_id,
                 chunk_id=chunk_id,
+                total_chunks=self.total_chunks,
                 scene=target_scene,
                 active_bin=target_scene,
                 dwell_remaining=self.dwell_time_sec,
@@ -333,6 +345,7 @@ class Controller:
         self.logger.update_status(
             book_id=book_id,
             chunk_id=chunk_id,
+            total_chunks=self.total_chunks,
             scene=target_scene,
             active_bin=self.current_scene,
             dwell_remaining=0,

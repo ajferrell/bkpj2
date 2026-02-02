@@ -14,7 +14,7 @@ from xml.etree import ElementTree as ET
 from ebooklib import epub
 from ebooklib import ITEM_DOCUMENT
 
-from canonicalize import canonicalize_xhtml, compute_sha256
+from .canonicalize import canonicalize_xhtml, compute_sha256
 
 
 class EPUBPreprocessor:

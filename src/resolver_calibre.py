@@ -14,7 +14,7 @@ from pathlib import Path
 from typing import Optional, Dict, Tuple
 from dataclasses import dataclass
 
-from chunk_index import ChunkIndex, load_chunk_index
+from .chunk_index import ChunkIndex, load_chunk_index
 
 
 # Configure logging
@@ -57,8 +57,8 @@ class CalibreCFIResolver:
         # Load chunk index for binary search
         self.chunk_index = load_chunk_index(str(timeline_path))
         
-        # Path to helper script
-        self.helper_script = Path(__file__).parent / "tools" / "resolve_cfi_calibre.py"
+        # Path to helper script (now in src/calibre/)
+        self.helper_script = Path(__file__).parent / "calibre" / "cfi_helper.py"
         
         # Cache for last successful resolution
         self._cache_cfi: Optional[str] = None

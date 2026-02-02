@@ -12,12 +12,12 @@ import time
 from pathlib import Path
 from typing import Optional
 
-from audio_engine import AudioEngine
-from controller import Controller
-from watcher import CalibreWatcher
-from resolver_calibre import CalibreCFIResolver
-from logger import OrchestratorLogger
-from preprocessor import preprocess_epub
+from src.audio_engine import AudioEngine
+from src.controller import Controller
+from src.watcher import CalibreWatcher
+from src.resolver_calibre import CalibreCFIResolver
+from src.logger import OrchestratorLogger
+from src.preprocessor import preprocess_epub
 
 
 def find_timeline_for_calibre_id(calibre_id: str, data_dir: Path, book_id_mapping: dict) -> Optional[Path]:
@@ -171,6 +171,7 @@ class Orchestrator:
                 self.logger.update_status(
                     book_id="dummy_book",
                     chunk_id=chunk_id,
+                    total_chunks=100,  # Dummy total
                     confidence=confidence
                 )
                 
@@ -270,7 +271,12 @@ class Orchestrator:
                             logger=self.logger
                         )
                         
-                        self.logger.update_status(book_id=calibre_id)
+                        # Set total chunks for percentage display
+                        total_chunks = timeline_data.get('total_chunks')
+                        if total_chunks:
+                            self.controller.set_total_chunks(total_chunks)
+                        
+                        self.logger.update_status(book_id=book_id, total_chunks=total_chunks)
                     
                     # Resolve CFI to chunk using exact resolver
                     if self.resolver:

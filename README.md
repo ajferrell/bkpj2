@@ -92,14 +92,14 @@ python main.py list
 
 Test the CFI resolver with specific CFIs:
 ```bash
-python scripts/test_resolver.py path/to/your/book.epub "epubcfi(/8/2/4/140/1:5)"
+python tests/test_resolver.py path/to/your/book.epub "epubcfi(/8/2/4/140/1:5)"
 ```
 
 ### Console Output
 
 While running, you'll see a status line like:
 ```
-book=mybook | chunk=42 | scene=tension | active=tension | dwell=85s | conf=0.89
+book=mybook | chunk=42/317 (13.2%) | scene=tension | active=tension | dwell=85s | conf=0.89
 ```
 
 ### Logs
@@ -205,21 +205,25 @@ Future versions will use ML-based scene classification.
 ```
 book_project2/
 ├── main.py              # CLI entry point
-├── audio_engine.py      # Two-deck WAV player with crossfading
-├── controller.py        # State machine and anti-thrash logic
-├── watcher.py           # Calibre annotations watcher
-├── preprocessor.py      # EPUB text extraction and chunking
-├── canonicalize.py      # Shared text canonicalization logic
-├── chunk_index.py       # Binary search chunk lookup
-├── resolver_calibre.py  # Runtime CFI resolver (calls calibre-debug)
-├── runtime_orchestrator.py  # High-level orchestration
-├── logger.py            # JSONL logging and status display
 ├── config.json          # Configuration
 ├── requirements.txt     # Python dependencies
-├── tools/
-│   └── resolve_cfi_calibre.py  # Calibre CFI helper (runs under calibre-debug)
-├── scripts/
-│   └── test_resolver.py # Test CFI resolution
+├── README.md            # This file
+├── src/                 # Core modules
+│   ├── __init__.py
+│   ├── audio_engine.py      # Two-deck WAV player with crossfading
+│   ├── controller.py        # State machine and anti-thrash logic
+│   ├── watcher.py           # Calibre annotations watcher
+│   ├── preprocessor.py      # EPUB text extraction and chunking
+│   ├── canonicalize.py      # Shared text canonicalization logic
+│   ├── chunk_index.py       # Binary search chunk lookup
+│   ├── resolver_calibre.py  # Runtime CFI resolver (calls calibre-debug)
+│   ├── runtime_orchestrator.py  # High-level orchestration
+│   ├── logger.py            # JSONL logging and status display
+│   └── calibre/
+│       └── cfi_helper.py    # Calibre CFI helper (runs under calibre-debug)
+├── tests/               # Test suite
+│   ├── test_resolver.py     # Test CFI resolution
+│   └── check_setup.py       # Verify installation
 ├── data/                # Book timelines (generated)
 │   └── <book_id>/
 │       └── timeline.json
@@ -233,22 +237,7 @@ book_project2/
 
 ### Test CFI Resolution
 ```bash
-python scripts/test_resolver.py path/to/book.epub "epubcfi(/8/2/4/140/1:5)"
-```
-
-### Test Audio Engine (Dummy Mode)
-```bash
-python audio_engine.py
-```
-
-### Test Calibre Watcher
-```bash
-python watcher.py
-```
-
-### Test CFI Resolver
-```bash
-python resolver.py
+python tests/test_resolver.py path/to/book.epub "epubcfi(/8/2/4/140/1:5)"
 ```
 
 ### Test Full System (Dummy Mode)

@@ -19,6 +19,7 @@ class OrchestratorLogger:
         self.current_status = {
             'book_id': None,
             'chunk_id': None,
+            'total_chunks': None,
             'scene': None,
             'active_bin': None,
             'dwell_remaining': None,
@@ -52,6 +53,7 @@ class OrchestratorLogger:
         self,
         book_id: Optional[str] = None,
         chunk_id: Optional[int] = None,
+        total_chunks: Optional[int] = None,
         scene: Optional[str] = None,
         active_bin: Optional[str] = None,
         dwell_remaining: Optional[float] = None,
@@ -63,6 +65,8 @@ class OrchestratorLogger:
             self.current_status['book_id'] = book_id
         if chunk_id is not None:
             self.current_status['chunk_id'] = chunk_id
+        if total_chunks is not None:
+            self.current_status['total_chunks'] = total_chunks
         if scene is not None:
             self.current_status['scene'] = scene
         if active_bin is not None:
@@ -90,7 +94,12 @@ class OrchestratorLogger:
             parts.append(f"book={s['book_id']}")
         
         if s['chunk_id'] is not None:
-            parts.append(f"chunk={s['chunk_id']}")
+            total = s.get('total_chunks')
+            if total:
+                pct = (s['chunk_id'] / total) * 100
+                parts.append(f"chunk={s['chunk_id']}/{total} ({pct:.1f}%)")
+            else:
+                parts.append(f"chunk={s['chunk_id']}")
         
         if s['scene']:
             parts.append(f"scene={s['scene']}")

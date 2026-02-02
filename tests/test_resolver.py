@@ -2,7 +2,7 @@
 Test script for CFI resolution and chunk lookup.
 
 Usage:
-    python scripts/test_resolver.py <epub_path> [cfi1] [cfi2] ...
+    python tests/test_resolver.py <epub_path> [cfi1] [cfi2] ...
     
 If no CFIs provided, attempts to read from Calibre annots.
 """
@@ -12,12 +12,12 @@ import json
 import logging
 from pathlib import Path
 
-# Add parent directory to path
+# Add parent directory to path for src imports
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
-from preprocessor import preprocess_epub
-from resolver_calibre import CalibreCFIResolver
-from chunk_index import ChunkIndex
+from src.preprocessor import preprocess_epub
+from src.resolver_calibre import CalibreCFIResolver
+from src.chunk_index import ChunkIndex
 
 
 def setup_logging():
