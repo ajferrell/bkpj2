@@ -32,12 +32,14 @@ class Controller:
         scene_list: List[str],
         dwell_time_sec: float = 120.0,
         k_consecutive: int = 0,
-        logger: Optional[OrchestratorLogger] = None
+        logger: Optional[OrchestratorLogger] = None,
+        timeline: Optional[dict] = None
     ):
         self.scene_list = scene_list
         self.dwell_time_sec = dwell_time_sec
         self.k_consecutive = k_consecutive
         self.logger = logger or OrchestratorLogger()
+        self.timeline = timeline  # Timeline data with chunks
         
         # State
         self.state = ControllerState.IDLE
@@ -54,6 +56,10 @@ class Controller:
     def set_total_chunks(self, total: int):
         """Set total chunks for percentage display."""
         self.total_chunks = total
+    
+    def set_timeline(self, timeline: dict):
+        """Set timeline data for scene label lookup."""
+        self.timeline = timeline
     
     def update(
         self,
@@ -355,7 +361,21 @@ class Controller:
         return self.current_scene
     
     def _get_scene_for_chunk(self, chunk_id: int) -> str:
-        """Dummy scene assignment: cycle through scenes."""
+        """
+        Get scene for chunk from timeline data.
+        Falls back to cycling if no timeline or no scene_label.
+        """
+        if self.timeline and 'chunks' in self.timeline:
+            chunks = self.timeline['chunks']
+            # Find chunk by chunk_id
+            for chunk in chunks:
+                if chunk.get('chunk_id') == chunk_id:
+                    scene_label = chunk.get('scene_label')
+                    if scene_label:
+                        return scene_label
+                    break
+        
+        # Fallback: cycle through scenes (dummy mode)
         return self.scene_list[chunk_id % len(self.scene_list)]
     
     def get_state(self) -> ControllerState:

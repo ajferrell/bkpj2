@@ -25,7 +25,12 @@ A Python-only prototype that plays looping ambient audio synchronized with your 
    pip install -r requirements.txt
    ```
 
-2. Place WAV files in the `audio/` directory:
+2. **(Optional)** Install ML dependencies for scene scoring:
+   ```bash
+   pip install transformers torch
+   ```
+
+3. Place WAV files in the `audio/` directory:
    - `audio/conflict.wav`
    - `audio/tension.wav`
    - `audio/movement.wav`
@@ -49,6 +54,56 @@ This creates `data/<book_id>/timeline.json` containing:
 - **Spine entries**: Global start positions for each document
 - **Chunks**: Global character offsets for each ~250-400 word chunk
 - **Canonicalized text**: Deterministic extraction (strips scripts/styles, normalizes whitespace)
+
+Also creates `data/<book_id>/canonical_text.txt` with the full canonical text stream.
+
+### 1b. ML Scene Scoring (Optional)
+
+Add automatic scene labels using zero-shot NLI classification:
+
+```bash
+# During preprocessing:
+python main.py preprocess path/to/your/book.epub --ml
+
+# Or separately on already-preprocessed books:
+python main.py score_ml <book_id>
+
+# Force recomputation:
+python main.py score_ml <book_id> --force
+
+# Use a different model:
+python main.py score_ml <book_id> --model facebook/bart-large-mnli
+```
+
+This assigns scene labels to each chunk:
+- Uses the 6 fixed scene labels: `conflict`, `tension`, `movement`, `dialogue`, `reflection`, `wonder`
+- Small chunks (< 40 words or < 200 chars) inherit labels from neighbors
+- Large chunks (> 450 words) are truncated for faster scoring
+- Results are stored in `timeline.json` with per-chunk `scene_label`, `scene_scores`, `scene_conf`
+- Summary statistics saved to `data/<book_id>/ml_summary.json`
+
+**Resume support**: Progress is saved every 10 chunks. If interrupted, just re-run the same command to pick up where you left off.
+
+**Running long jobs with tmux/screen** (recommended for large books):
+```bash
+# Start a tmux session
+tmux new -s ml_scoring
+
+# Run the scoring (can take 30+ minutes for large books)
+python main.py score_ml <book_id>
+
+# Detach: Ctrl+B, then D
+# Reattach later:
+tmux attach -t ml_scoring
+
+# Or use screen:
+screen -S ml_scoring
+python main.py score_ml <book_id>
+# Detach: Ctrl+A, then D
+# Reattach: screen -r ml_scoring
+```
+
+On Windows without tmux, use Windows Terminal's background tabs or run in a minimized PowerShell window. The incremental saves mean you can safely Ctrl+C and resume later.
 
 ### 2. Run the orchestrator
 

@@ -2,6 +2,7 @@
 EPUB preprocessor: extract canonical text and build chunk timeline.
 
 Updated to support exact CFI-to-chunk mapping with global char offsets.
+Now supports optional ML scene scoring via --ml flag.
 """
 
 import json
@@ -15,6 +16,7 @@ from ebooklib import epub
 from ebooklib import ITEM_DOCUMENT
 
 from .canonicalize import canonicalize_xhtml, compute_sha256
+from .io_utils import save_canonical_text, check_canonical_text_valid, compute_text_hash
 
 
 class EPUBPreprocessor:
@@ -30,13 +32,20 @@ class EPUBPreprocessor:
         self.output_dir = Path(output_dir)
         self.book = None
         self.book_id = None
+        self.global_text = None  # Store for canonical_text.txt
         
         # Chunk parameters
         self.min_chunk_words = 250
         self.max_chunk_words = 400
     
-    def process(self) -> Path:
-        """Main processing pipeline."""
+    def process(self, run_ml: bool = False, ml_force: bool = False) -> Path:
+        """
+        Main processing pipeline.
+        
+        Args:
+            run_ml: If True, run ML scene scoring after preprocessing
+            ml_force: If True, force ML recomputation even if results exist
+        """
         print(f"Processing EPUB: {self.epub_path}")
         
         # Load EPUB
@@ -52,7 +61,12 @@ class EPUBPreprocessor:
         
         # Extract spine documents with global offsets
         spine_entries, global_text = self._extract_spine_with_global_offsets()
+        self.global_text = global_text
         print(f"Extracted {len(spine_entries)} spine items, {len(global_text)} chars total")
+        
+        # Save canonical_text.txt
+        text_path, text_hash = save_canonical_text(book_dir, global_text)
+        print(f"Saved canonical text to: {text_path}")
         
         # Build chunks with global offsets
         chunks = self._build_chunks_global(spine_entries, global_text)
@@ -64,6 +78,7 @@ class EPUBPreprocessor:
             "epub_path": str(self.epub_path),
             "total_chars": len(global_text),
             "total_chunks": len(chunks),
+            "canonical_text_hash": text_hash,
             "spine": spine_entries,
             "chunks": chunks
         }
@@ -73,6 +88,12 @@ class EPUBPreprocessor:
             json.dump(timeline, f, indent=2, ensure_ascii=False)
         
         print(f"Saved timeline to: {timeline_path}")
+        
+        # Run ML scoring if requested
+        if run_ml:
+            print("\n--- Running ML Scene Scoring ---")
+            from .ml_scene import run_ml_scoring
+            run_ml_scoring(book_dir, force=ml_force)
         
         return timeline_path
     
@@ -256,22 +277,34 @@ class EPUBPreprocessor:
         return chunks
 
 
-def preprocess_epub(epub_path: str, output_dir: str = "data") -> str:
+def preprocess_epub(epub_path: str, output_dir: str = "data", run_ml: bool = False, ml_force: bool = False) -> str:
     """
     Preprocess an EPUB file and return the timeline path.
+    
+    Args:
+        epub_path: Path to the EPUB file
+        output_dir: Base output directory for data
+        run_ml: If True, run ML scene scoring after preprocessing
+        ml_force: If True, force ML recomputation even if results exist
+        
+    Returns:
+        Path to the generated timeline.json
     """
     preprocessor = EPUBPreprocessor(epub_path, output_dir)
-    timeline_path = preprocessor.process()
+    timeline_path = preprocessor.process(run_ml=run_ml, ml_force=ml_force)
     return str(timeline_path)
 
 
 if __name__ == '__main__':
     import sys
+    import argparse
     
-    if len(sys.argv) < 2:
-        print("Usage: python preprocessor.py <epub_path>")
-        sys.exit(1)
+    parser = argparse.ArgumentParser(description="Preprocess EPUB for ambience orchestrator")
+    parser.add_argument('epub_path', help='Path to EPUB file')
+    parser.add_argument('--ml', action='store_true', help='Run ML scene scoring after preprocessing')
+    parser.add_argument('--force', action='store_true', help='Force ML recomputation')
     
-    epub_path = sys.argv[1]
-    timeline = preprocess_epub(epub_path)
+    args = parser.parse_args()
+    
+    timeline = preprocess_epub(args.epub_path, run_ml=args.ml, ml_force=args.force)
     print(f"\nDone! Timeline: {timeline}")

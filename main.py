@@ -3,6 +3,7 @@ EPUB Ambience Orchestrator (v1)
 Main entry point and orchestration logic.
 
 Updated to support exact CFI-to-chunk mapping via Calibre's CFI parser.
+Supports ML scene scoring via zero-shot NLI classification.
 """
 
 import argparse
@@ -268,7 +269,8 @@ class Orchestrator:
                         self.controller = Controller(
                             scene_list=self.scene_list,
                             dwell_time_sec=self.config['dwell_time_sec'],
-                            logger=self.logger
+                            logger=self.logger,
+                            timeline=timeline_data
                         )
                         
                         # Set total chunks for percentage display
@@ -318,12 +320,16 @@ def main():
         epilog="""
 Commands:
   preprocess <epub_path>    Preprocess an EPUB file
+  score_ml <book_id>        Run ML scene scoring on a preprocessed book
   run [--dummy]             Run the orchestrator
   link <calibre_id> <book_id>  Link Calibre annots ID to a book
   list                      List all preprocessed books
 
 Examples:
   python main.py preprocess mybook.epub
+  python main.py preprocess mybook.epub --ml
+  python main.py score_ml B0C5S477SF
+  python main.py score_ml B0C5S477SF --force
   python main.py run
   python main.py run --dummy
   python main.py link abc123def B0C5S477SF
@@ -333,7 +339,7 @@ Examples:
     
     parser.add_argument(
         'command',
-        choices=['preprocess', 'run', 'link', 'list'],
+        choices=['preprocess', 'score_ml', 'run', 'link', 'list'],
         help='Command to execute'
     )
     
@@ -362,19 +368,70 @@ Examples:
         help='Path to config file (default: config.json)'
     )
     
+    parser.add_argument(
+        '--ml',
+        action='store_true',
+        help='Run ML scene scoring after preprocessing'
+    )
+    
+    parser.add_argument(
+        '--force',
+        action='store_true',
+        help='Force ML recomputation even if results exist'
+    )
+    
+    parser.add_argument(
+        '--model',
+        type=str,
+        default='facebook/bart-large-mnli',
+        help='HuggingFace model for zero-shot classification (default: facebook/bart-large-mnli)'
+    )
+    
+    parser.add_argument(
+        '--batch-size',
+        type=int,
+        default=8,
+        help='Batch size for ML inference (default: 8)'
+    )
+    
     args = parser.parse_args()
     
     # Execute command
     if args.command == 'preprocess':
         if not args.args:
             print("Error: epub_path required for preprocess command")
-            print("Usage: python main.py preprocess <epub_path>")
+            print("Usage: python main.py preprocess <epub_path> [--ml] [--force]")
             sys.exit(1)
         
         epub_path = args.args[0]
         print(f"Preprocessing: {epub_path}\n")
-        timeline_path = preprocess_epub(epub_path)
+        timeline_path = preprocess_epub(epub_path, run_ml=args.ml, ml_force=args.force)
         print(f"\nDone! Timeline saved to: {timeline_path}")
+    
+    elif args.command == 'score_ml':
+        if not args.args:
+            print("Error: book_id required for score_ml command")
+            print("Usage: python main.py score_ml <book_id> [--force] [--model MODEL]")
+            sys.exit(1)
+        
+        book_id = args.args[0]
+        print(f"Running ML scene scoring for: {book_id}\n")
+        
+        from src.ml_scene import score_ml_from_book_id
+        try:
+            summary = score_ml_from_book_id(
+                book_id=book_id,
+                model_name=args.model,
+                batch_size=args.batch_size,
+                force=args.force
+            )
+            print(f"\nDone! Summary saved to: data/{book_id}/ml_summary.json")
+        except FileNotFoundError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+        except Exception as e:
+            print(f"Error during ML scoring: {e}")
+            sys.exit(1)
     
     elif args.command == 'link':
         if len(args.args) < 2:

@@ -2,3 +2,7 @@ ebooklib>=0.18
 sounddevice>=0.4.6
 numpy>=1.24.0
 watchdog>=3.0.0
+
+# ML dependencies (optional, for scene scoring)
+transformers>=4.30.0
+torch>=2.0.0
