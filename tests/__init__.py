@@ -1,3 +1,1 @@
-"""
-Test suite for EPUB Ambience Orchestrator.
-"""
+"""Active tests for the Calibre-native ambience tooling."""

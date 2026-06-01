@@ -235,7 +235,9 @@ def compute_canonical_offset(root, target_element, text_slot, char_offset_in_slo
     Compute the canonical character offset by traversing the document
     in canonical order until we reach the target text position.
     
-    This MUST match the canonicalization order used in preprocessing.
+    This is a diagnostic traversal used by the live CFI probe. Durable anchors
+    should eventually be generated from the same Calibre-compatible coordinate
+    model rather than from a separate generic EPUB text stream.
     
     Returns local_char_offset within the spine document's canonical text.
     """
@@ -299,6 +301,61 @@ def compute_canonical_offset(root, target_element, text_slot, char_offset_in_slo
     traverse(root)
     
     return found_offset[0]
+
+
+def canonical_text_for_preview(root):
+    """
+    Build a preview text stream with the same traversal/counting strategy used
+    by compute_canonical_offset(). This is diagnostic text, not a durable
+    preprocessing format.
+    """
+    parts = []
+
+    def traverse(elem):
+        tag = strip_namespace(elem.tag).lower() if elem.tag else ''
+
+        if tag in REMOVE_TAGS:
+            return
+
+        is_block = tag in BLOCK_TAGS
+
+        if is_block and parts:
+            parts.append('\n\n')
+
+        if elem.text:
+            text = normalize_whitespace(elem.text)
+            if text.strip():
+                parts.append(text)
+                parts.append(' ')
+
+        for child in elem:
+            traverse(child)
+            if child.tail:
+                text = normalize_whitespace(child.tail)
+                if text.strip():
+                    parts.append(text)
+                    parts.append(' ')
+
+        if is_block:
+            parts.append('\n\n')
+
+    traverse(root)
+    return ''.join(parts)
+
+
+def preview_around_offset(text, offset, radius=220):
+    """Return a compact text preview around an offset."""
+    if offset is None:
+        return ""
+    start = max(0, offset - radius)
+    end = min(len(text), offset + radius)
+    preview = text[start:end]
+    preview = re.sub(r'\s+', ' ', preview).strip()
+    if start > 0:
+        preview = '...' + preview
+    if end < len(text):
+        preview = preview + '...'
+    return preview
 
 
 def main():
@@ -401,12 +458,17 @@ def main():
             local_char_offset = 0
         
         log_info(f"Resolved: local_char_offset={local_char_offset}")
+
+        preview_text = canonical_text_for_preview(body)
+        preview = preview_around_offset(preview_text, local_char_offset)
         
         # Output result
         output_result({
             "spine_index": spine_index,
             "href": href,
-            "local_char_offset": local_char_offset
+            "local_char_offset": local_char_offset,
+            "spine_text_len": len(preview_text),
+            "text_preview": preview
         })
         
     except Exception as e:

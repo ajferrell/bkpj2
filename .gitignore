@@ -1,10 +1,16 @@
 __pycache__/
+.pytest_tmp/
+.pytest_cache/
+.test_tmp/
 *.pyc
 *.pyo
 *.log
 *.jsonl
 data/*/
+data/*.json
 !data/.gitkeep
 audio/*.wav
 venv/
+.venv/
 .env
+docs/

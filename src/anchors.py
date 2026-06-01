@@ -1,0 +1,563 @@
+"""Book anchor preparation and lookup."""
+
+from __future__ import annotations
+
+import json
+import re
+import subprocess
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Optional
+
+from .cfi_fixtures import file_sha256
+
+
+TIMELINE_SCHEMA_VERSION = 2
+
+DEFAULT_REGION_CONFIG = {
+    "min_anchors": 3,
+    "target_anchors": 8,
+    "max_anchors": 18,
+    "boundary_threshold": 0.65,
+}
+
+KEYWORD_GROUPS = {
+    "weather": {
+        "rain",
+        "storm",
+        "thunder",
+        "lightning",
+        "wind",
+        "snow",
+        "fog",
+    },
+    "setting": {
+        "forest",
+        "wood",
+        "woods",
+        "city",
+        "street",
+        "road",
+        "room",
+        "house",
+        "castle",
+        "river",
+        "sea",
+        "cave",
+    },
+    "combat": {
+        "fight",
+        "battle",
+        "sword",
+        "blood",
+        "gun",
+        "shot",
+        "attack",
+        "wound",
+    },
+}
+
+
+def timeline_dir(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return Path(data_dir) / "books" / str(calibre_book_id)
+
+
+def timeline_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return timeline_dir(data_dir, calibre_book_id) / "timeline.json"
+
+
+def prepare_book_timeline(
+    book: dict[str, Any],
+    data_dir: str | Path = "data",
+    target_words: int = 350,
+    min_words: int = 180,
+    regions: bool = False,
+    region_config: Optional[dict[str, Any]] = None,
+    spine_extractor= None,
+) -> Path:
+    epub_path = book.get("preferred_epub_path")
+    if not epub_path:
+        raise ValueError(f"Book has no EPUB path: {book.get('title')}")
+
+    extractor = spine_extractor or extract_spine_texts_with_calibre
+    spine = extractor(epub_path)
+    source_units = extract_source_units(spine)
+    anchors = build_anchors(source_units, target_words=target_words, min_words=min_words)
+    features = extract_anchor_features(anchors)
+    config = {**DEFAULT_REGION_CONFIG, **(region_config or {})}
+    timeline = {
+        "schema_version": TIMELINE_SCHEMA_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "builder": {
+            "name": "anchor_builder",
+            "target_words": target_words,
+            "min_words": min_words,
+            "regions": bool(regions),
+            "region_config": config,
+        },
+        "book": {
+            "calibre_book_id": book.get("calibre_book_id"),
+            "calibre_uuid": book.get("calibre_uuid"),
+            "title": book.get("title"),
+            "authors": book.get("authors") or [],
+            "epub_path": epub_path,
+            "epub_hash": file_sha256(epub_path),
+            "annots_key": book.get("annots_key"),
+        },
+        "spine": [
+            {
+                "spine_index": item["spine_index"],
+                "href": item["href"],
+                "text_len": item.get("text_len", len(item.get("text", ""))),
+            }
+            for item in spine
+        ],
+        "source_units": [serialize_source_unit(unit) for unit in source_units],
+        "anchors": anchors,
+        "features": features,
+    }
+    if regions:
+        provider = BoundaryProvider()
+        candidates = provider.score_boundaries(source_units, anchors, features, config)
+        result = build_regions(anchors, candidates, config)
+        timeline["regions"] = result["regions"]
+
+    out_dir = timeline_dir(data_dir, book["calibre_book_id"])
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = out_dir / "timeline.json"
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(timeline, f, indent=2, ensure_ascii=False)
+    return path
+
+
+def load_timeline(data_dir: str | Path, calibre_book_id: int | str) -> dict[str, Any]:
+    path = timeline_path(data_dir, calibre_book_id)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def extract_spine_texts_with_calibre(epub_path: str | Path) -> list[dict[str, Any]]:
+    helper = Path(__file__).parent / "calibre" / "anchor_helper.py"
+    cmd = [
+        "calibre-debug",
+        "--exec-file",
+        str(helper),
+        "--",
+        str(epub_path),
+    ]
+    try:
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=120)
+    except FileNotFoundError as e:
+        raise RuntimeError("calibre-debug not found on PATH") from e
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError("calibre-debug anchor extraction timed out") from e
+
+    if not result.stdout.strip():
+        raise RuntimeError(f"calibre-debug produced no anchor JSON. stderr={result.stderr[-1000:]}")
+    try:
+        data = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as e:
+        raise RuntimeError(f"Could not parse anchor JSON: {result.stdout[:1000]}") from e
+    if data.get("error"):
+        raise RuntimeError(data["error"])
+    return data.get("spine", [])
+
+
+def build_anchors_from_spine(
+    spine: list[dict[str, Any]],
+    target_words: int = 350,
+    min_words: int = 180,
+) -> list[dict[str, Any]]:
+    return build_anchors(extract_source_units(spine), target_words=target_words, min_words=min_words)
+
+
+def extract_source_units(spine: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    source_units: list[dict[str, Any]] = []
+    unit_id = 0
+    for item in spine:
+        text = item.get("text") or ""
+        for para in paragraph_spans(text):
+            source_units.append({
+                "unit_id": unit_id,
+                "spine_index": item["spine_index"],
+                "href": item["href"],
+                "start_local_offset": para["start"],
+                "end_local_offset": para["end"],
+                "kind": "paragraph",
+                "word_count": para["word_count"],
+                "preview": preview_text(para["text"]),
+                "_text": para["text"],
+            })
+            unit_id += 1
+    return source_units
+
+
+def serialize_source_unit(unit: dict[str, Any]) -> dict[str, Any]:
+    return {key: value for key, value in unit.items() if not key.startswith("_")}
+
+
+def build_anchors(
+    source_units: list[dict[str, Any]],
+    target_words: int = 350,
+    min_words: int = 180,
+) -> list[dict[str, Any]]:
+    anchors: list[dict[str, Any]] = []
+    anchor_id = 0
+    by_spine: list[list[dict[str, Any]]] = []
+    for unit in source_units:
+        if not by_spine or by_spine[-1][0]["spine_index"] != unit["spine_index"]:
+            by_spine.append([])
+        by_spine[-1].append(unit)
+
+    for units in by_spine:
+        current: list[dict[str, Any]] = []
+        current_words = 0
+
+        for unit in units:
+            if current and current_words >= min_words and current_words + unit["word_count"] > target_words:
+                anchors.append(make_anchor(anchor_id, current))
+                anchor_id += 1
+                current = []
+                current_words = 0
+
+            current.append(unit)
+            current_words += unit["word_count"]
+
+        if current:
+            if anchors and anchors[-1]["position"]["spine_index"] == current[0]["spine_index"] and current_words < min_words:
+                merge_anchor_tail(anchors[-1], current)
+            else:
+                anchors.append(make_anchor(anchor_id, current))
+                anchor_id += 1
+    return anchors
+
+
+def paragraph_spans(text: str) -> list[dict[str, Any]]:
+    spans = []
+    for match in re.finditer(r"\S[\s\S]*?(?=\n\s*\n|$)", text):
+        raw = match.group(0)
+        normalized = re.sub(r"\s+", " ", raw).strip()
+        if not normalized:
+            continue
+        spans.append({
+            "start": match.start(),
+            "end": match.end(),
+            "text": normalized,
+            "word_count": len(normalized.split()),
+        })
+    return spans
+
+
+def make_anchor(anchor_id: int, source_units: list[dict[str, Any]]) -> dict[str, Any]:
+    start = source_units[0]["start_local_offset"]
+    end = source_units[-1]["end_local_offset"]
+    plain = "\n\n".join(p["_text"] for p in source_units)
+    return {
+        "anchor_id": anchor_id,
+        "source_unit_start": source_units[0]["unit_id"],
+        "source_unit_end": source_units[-1]["unit_id"] + 1,
+        "position": {
+            "spine_index": source_units[0]["spine_index"],
+            "href": source_units[0]["href"],
+            "start_local_offset": start,
+            "end_local_offset": end,
+        },
+        "text": {
+            "plain": plain,
+            "preview": preview_text(plain),
+            "word_count": sum(p["word_count"] for p in source_units),
+            "char_count": len(plain),
+            "paragraph_count": len(source_units),
+        },
+    }
+
+
+def merge_anchor_tail(anchor: dict[str, Any], source_units: list[dict[str, Any]]) -> None:
+    plain = anchor["text"]["plain"] + "\n\n" + "\n\n".join(p["_text"] for p in source_units)
+    anchor["source_unit_end"] = source_units[-1]["unit_id"] + 1
+    anchor["position"]["end_local_offset"] = source_units[-1]["end_local_offset"]
+    anchor["text"]["plain"] = plain
+    anchor["text"]["preview"] = preview_text(plain)
+    anchor["text"]["word_count"] += sum(p["word_count"] for p in source_units)
+    anchor["text"]["char_count"] = len(plain)
+    anchor["text"]["paragraph_count"] += len(source_units)
+
+
+def extract_anchor_features(anchors: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [anchor_feature(anchor) for anchor in anchors]
+
+
+def anchor_feature(anchor: dict[str, Any]) -> dict[str, Any]:
+    text = anchor.get("text", {}).get("plain", "")
+    words = re.findall(r"[A-Za-z']+", text.casefold())
+    sentences = [s for s in re.split(r"[.!?]+", text) if s.strip()]
+    quote_chars = sum(text.count(mark) for mark in ['"', "'", "\u201c", "\u201d", "\u2018", "\u2019"])
+    punctuation = sum(1 for char in text if char in ",.;:!?")
+    keyword_hits = {
+        group: sorted({word for word in words if word in keywords})
+        for group, keywords in KEYWORD_GROUPS.items()
+    }
+    return {
+        "anchor_id": anchor["anchor_id"],
+        "dialogue_ratio": round(min(1.0, quote_chars / max(1, len(text))), 4),
+        "paragraph_count": anchor.get("text", {}).get("paragraph_count", 0),
+        "avg_sentence_words": round(len(words) / max(1, len(sentences)), 2),
+        "punctuation_density": round(punctuation / max(1, len(text)), 4),
+        "keyword_hits": keyword_hits,
+    }
+
+
+class BoundaryProvider:
+    def score_boundaries(
+        self,
+        source_units: list[dict[str, Any]],
+        anchors: list[dict[str, Any]],
+        features: list[dict[str, Any]],
+        config: dict[str, Any],
+    ) -> list[dict[str, Any]]:
+        candidates = []
+        for boundary_unit in range(1, len(source_units)):
+            prev_unit = source_units[boundary_unit - 1]
+            next_unit = source_units[boundary_unit]
+            prev_anchor = find_anchor_covering_source_unit(anchors, prev_unit["unit_id"])
+            next_anchor = find_anchor_covering_source_unit(anchors, next_unit["unit_id"])
+            if not prev_anchor or not next_anchor:
+                continue
+
+            anchor_boundary, snap = snap_source_boundary_to_anchor(anchors, boundary_unit)
+            prev_feature = features[prev_anchor["anchor_id"]]
+            next_feature = features[next_anchor["anchor_id"]]
+            score, reasons = score_boundary_pair(prev_unit, next_unit, prev_feature, next_feature)
+            candidates.append({
+                "candidate_id": len(candidates),
+                "preferred_boundary": {
+                    "kind": "source_unit",
+                    "source_unit_id": boundary_unit,
+                    "spine_index": next_unit["spine_index"],
+                    "href": next_unit["href"],
+                    "local_offset": next_unit["start_local_offset"],
+                },
+                "source_unit_boundary": boundary_unit,
+                "anchor_boundary": anchor_boundary,
+                "snap": snap,
+                "score": round(score, 3),
+                "reasons": reasons,
+                "selected": False,
+                "rejected_reason": None,
+            })
+        return candidates
+
+
+def score_boundary_pair(
+    prev_unit: dict[str, Any],
+    next_unit: dict[str, Any],
+    prev_feature: dict[str, Any],
+    next_feature: dict[str, Any],
+) -> tuple[float, list[str]]:
+    score = 0.0
+    reasons: list[str] = []
+    if prev_unit["spine_index"] != next_unit["spine_index"] or prev_unit["href"] != next_unit["href"]:
+        score += 1.0
+        reasons.append("chapter_start")
+    if is_scene_separator(prev_unit.get("_text", prev_unit.get("preview", ""))) or is_scene_separator(next_unit.get("_text", next_unit.get("preview", ""))):
+        score += 0.8
+        reasons.append("scene_separator")
+
+    dialogue_delta = abs(prev_feature["dialogue_ratio"] - next_feature["dialogue_ratio"])
+    if dialogue_delta >= 0.02:
+        score += min(0.25, dialogue_delta * 4)
+        reasons.append("dialogue_shift")
+
+    prev_keywords = flatten_keywords(prev_feature["keyword_hits"])
+    next_keywords = flatten_keywords(next_feature["keyword_hits"])
+    if prev_keywords != next_keywords:
+        score += min(0.25, 0.08 * len(prev_keywords.symmetric_difference(next_keywords)))
+        reasons.append("keyword_shift")
+
+    sentence_delta = abs(prev_feature["avg_sentence_words"] - next_feature["avg_sentence_words"])
+    punctuation_delta = abs(prev_feature["punctuation_density"] - next_feature["punctuation_density"])
+    if sentence_delta >= 8 or punctuation_delta >= 0.03:
+        score += min(0.25, sentence_delta / 60 + punctuation_delta * 3)
+        reasons.append("pacing_shift")
+
+    return score, reasons
+
+
+def build_regions(
+    anchors: list[dict[str, Any]],
+    boundary_candidates: list[dict[str, Any]],
+    config: dict[str, Any],
+) -> dict[str, Any]:
+    if not anchors:
+        return {"regions": [], "boundary_candidates": boundary_candidates}
+
+    min_anchors = int(config.get("min_anchors", DEFAULT_REGION_CONFIG["min_anchors"]))
+    max_anchors = int(config.get("max_anchors", DEFAULT_REGION_CONFIG["max_anchors"]))
+    threshold = float(config.get("boundary_threshold", DEFAULT_REGION_CONFIG["boundary_threshold"]))
+    by_edge = best_candidate_by_anchor_edge(boundary_candidates)
+    selected: list[dict[str, Any]] = [book_boundary_candidate(0, "book_start")]
+    region_start = 0
+
+    for edge in range(1, len(anchors)):
+        candidate = by_edge.get(edge)
+        length = edge - region_start
+        if length >= max_anchors:
+            selected.append(select_boundary(edge, candidate, "max_region_length", 1.0))
+            region_start = edge
+        elif length < min_anchors:
+            if candidate:
+                candidate["rejected_reason"] = "too_short"
+        elif candidate and candidate["score"] >= threshold:
+            selected.append(select_boundary(edge, candidate, None, candidate["score"]))
+            region_start = edge
+        elif candidate:
+            candidate["rejected_reason"] = "score_below_threshold"
+
+    selected.append(book_boundary_candidate(len(anchors), "book_end"))
+    regions = []
+    for region_id, (boundary_in, boundary_out) in enumerate(zip(selected, selected[1:])):
+        start = boundary_in["anchor_boundary"]
+        end = boundary_out["anchor_boundary"]
+        if start == end:
+            continue
+        region_anchors = anchors[start:end]
+        regions.append({
+            "region_id": region_id,
+            "anchor_start": start,
+            "anchor_end": end,
+            "source_unit_start": region_anchors[0]["source_unit_start"],
+            "source_unit_end": region_anchors[-1]["source_unit_end"],
+            "boundary_in": boundary_summary(boundary_in),
+            "boundary_out": boundary_summary(boundary_out),
+            "stats": {
+                "word_count": sum(a["text"]["word_count"] for a in region_anchors),
+                "anchor_count": len(region_anchors),
+            },
+            "preview": preview_text(region_anchors[0]["text"]["preview"]),
+        })
+    return {"regions": regions, "boundary_candidates": boundary_candidates}
+
+
+def best_candidate_by_anchor_edge(candidates: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+    by_edge: dict[int, dict[str, Any]] = {}
+    for candidate in candidates:
+        edge = candidate["anchor_boundary"]
+        if edge <= 0:
+            continue
+        if edge not in by_edge or candidate["score"] > by_edge[edge]["score"]:
+            by_edge[edge] = candidate
+    return by_edge
+
+
+def select_boundary(
+    edge: int,
+    candidate: Optional[dict[str, Any]],
+    added_reason: Optional[str],
+    minimum_score: float,
+) -> dict[str, Any]:
+    if candidate is None:
+        candidate = {
+            "anchor_boundary": edge,
+            "score": minimum_score,
+            "reasons": [],
+            "snap": "anchor_edge",
+            "selected": False,
+        }
+    candidate["selected"] = True
+    candidate["rejected_reason"] = None
+    candidate["score"] = round(max(candidate.get("score", 0), minimum_score), 3)
+    if added_reason and added_reason not in candidate["reasons"]:
+        candidate["reasons"].append(added_reason)
+    return candidate
+
+
+def book_boundary_candidate(edge: int, reason: str) -> dict[str, Any]:
+    return {
+        "anchor_boundary": edge,
+        "score": 1.0,
+        "reasons": [reason],
+        "snap": "exact",
+        "selected": True,
+        "rejected_reason": None,
+    }
+
+
+def boundary_summary(candidate: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "score": candidate["score"],
+        "reasons": candidate.get("reasons", []),
+    }
+
+
+def find_anchor_covering_source_unit(anchors: list[dict[str, Any]], source_unit_id: int) -> Optional[dict[str, Any]]:
+    for anchor in anchors:
+        if anchor["source_unit_start"] <= source_unit_id < anchor["source_unit_end"]:
+            return anchor
+    return None
+
+
+def snap_source_boundary_to_anchor(anchors: list[dict[str, Any]], source_unit_boundary: int) -> tuple[int, str]:
+    best_edge = 0
+    best_distance: Optional[int] = None
+    for edge in range(1, len(anchors)):
+        anchor_source_boundary = anchors[edge]["source_unit_start"]
+        distance = abs(anchor_source_boundary - source_unit_boundary)
+        if best_distance is None or distance < best_distance:
+            best_edge = edge
+            best_distance = distance
+    snap = "exact" if best_distance == 0 else "nearest_anchor"
+    return best_edge, snap
+
+
+def is_scene_separator(text: str) -> bool:
+    compact = re.sub(r"\s+", "", text)
+    return bool(compact) and len(compact) <= 5 and set(compact) <= {"*", "#", "-", "_"}
+
+
+def flatten_keywords(keyword_hits: dict[str, list[str]]) -> set[str]:
+    words: set[str] = set()
+    for hits in keyword_hits.values():
+        words.update(hits)
+    return words
+
+
+def find_region_for_anchor(timeline: dict[str, Any], anchor_id: int) -> Optional[dict[str, Any]]:
+    for region in timeline.get("regions", []):
+        if region["anchor_start"] <= anchor_id < region["anchor_end"]:
+            return region
+    return None
+
+
+def preview_text(text: str, limit: int = 180) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip() + "..."
+
+
+def find_anchor_for_position(
+    timeline: dict[str, Any],
+    spine_index: int,
+    local_char_offset: int,
+) -> Optional[dict[str, Any]]:
+    candidates = [
+        a for a in timeline.get("anchors", [])
+        if a.get("position", {}).get("spine_index") == spine_index
+    ]
+    if not candidates:
+        return None
+    for anchor in candidates:
+        pos = anchor["position"]
+        if pos["start_local_offset"] <= local_char_offset < pos["end_local_offset"]:
+            return anchor
+    before = [a for a in candidates if a["position"]["end_local_offset"] <= local_char_offset]
+    after = [a for a in candidates if a["position"]["start_local_offset"] > local_char_offset]
+    if before and not after:
+        return before[-1]
+    if after and not before:
+        return after[0]
+    if before and after:
+        prev_dist = abs(local_char_offset - before[-1]["position"]["end_local_offset"])
+        next_dist = abs(local_char_offset - after[0]["position"]["start_local_offset"])
+        return before[-1] if prev_dist <= next_dist else after[0]
+    return None

@@ -1,484 +1,490 @@
 """
-EPUB Ambience Orchestrator (v1)
-Main entry point and orchestration logic.
+Calibre-native adaptive ambience command line.
 
-Updated to support exact CFI-to-chunk mapping via Calibre's CFI parser.
-Supports ML scene scoring via zero-shot NLI classification.
+The rebuilt entry point starts with the coordinate spine:
+Calibre library import, deterministic viewer annotation mapping, and live CFI
+inspection. Semantic regions and audio scoring build on this foundation later.
 """
 
+from __future__ import annotations
+
 import argparse
-import json
 import sys
-import time
 from pathlib import Path
-from typing import Optional
+from typing import Any
 
-from src.audio_engine import AudioEngine
-from src.controller import Controller
-from src.watcher import CalibreWatcher
-from src.resolver_calibre import CalibreCFIResolver
-from src.logger import OrchestratorLogger
-from src.preprocessor import preprocess_epub
-
-
-def find_timeline_for_calibre_id(calibre_id: str, data_dir: Path, book_id_mapping: dict) -> Optional[Path]:
-    """
-    Find the timeline.json for a Calibre annotation ID.
-    
-    Search order:
-    1. Check book_id_mapping in config
-    2. Search all timelines for matching calibre_id field
-    3. Try calibre_id as direct book_id
-    
-    Returns the timeline path if found, None otherwise.
-    """
-    # 1. Check explicit mapping
-    if calibre_id in book_id_mapping:
-        mapped_id = book_id_mapping[calibre_id]
-        timeline_path = data_dir / mapped_id / "timeline.json"
-        if timeline_path.exists():
-            return timeline_path
-    
-    # 2. Search all timelines for calibre_id field
-    if data_dir.exists():
-        for subdir in data_dir.iterdir():
-            if subdir.is_dir():
-                timeline_path = subdir / "timeline.json"
-                if timeline_path.exists():
-                    try:
-                        with open(timeline_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        # Check if this timeline has a calibre_id that matches
-                        if data.get('calibre_id') == calibre_id:
-                            return timeline_path
-                    except Exception:
-                        continue
-    
-    # 3. Try calibre_id as direct book_id
-    timeline_path = data_dir / calibre_id / "timeline.json"
-    if timeline_path.exists():
-        return timeline_path
-    
-    return None
+from src.calibre_native import (
+    compute_annots_key,
+    default_calibre_annots_dir,
+    find_book,
+    find_book_by_annots_key,
+    import_calibre_library,
+    iter_manifest_books,
+    newest_live_annotation,
+    read_live_annotation_for_book,
+)
+from src.anchors import (
+    find_anchor_for_position,
+    find_region_for_anchor,
+    load_timeline,
+    prepare_book_timeline,
+    timeline_path,
+)
+from src.cfi_fixtures import (
+    capture_live_fixture,
+    check_fixtures,
+    current_live_probe,
+    default_fixture_dir,
+    run_calibre_cfi_probe,
+    timestamp_name,
+)
 
 
-def link_calibre_to_book(calibre_id: str, book_id: str, data_dir: Path) -> bool:
-    """
-    Link a Calibre annotation ID to a preprocessed book by storing it in timeline.
-    
-    Returns True if successful.
-    """
-    timeline_path = data_dir / book_id / "timeline.json"
-    if not timeline_path.exists():
-        print(f"Error: No timeline found for book_id '{book_id}'")
-        return False
-    
+def cmd_import_calibre(args: argparse.Namespace) -> int:
+    books, path = import_calibre_library(args.library_path, data_dir=args.data_dir)
+    epub_books = [b for b in books if b.preferred_epub_path]
+    print(f"Imported Calibre library: {Path(args.library_path).resolve()}")
+    print(f"Books with EPUB: {len(epub_books)}")
+    print(f"Manifest: {path}")
+    if epub_books:
+        print("\nSample:")
+        for book in epub_books[: args.limit]:
+            print(f"  {book.calibre_book_id}: {book.title} - {book.display_author}")
+            print(f"     EPUB: {book.preferred_epub_path}")
+            print(f"     Annots: {book.annots_key}")
+    return 0
+
+
+def cmd_list_books(args: argparse.Namespace) -> int:
+    books = list(iter_manifest_books(args.data_dir))
+    if args.epub_only:
+        books = [b for b in books if b.get("preferred_epub_path")]
+    if args.query:
+        q = args.query.casefold()
+        books = [
+            b for b in books
+            if q in (b.get("title") or "").casefold()
+            or q in " ".join(b.get("authors") or []).casefold()
+            or q == str(b.get("calibre_book_id"))
+        ]
+
+    if not books:
+        print("No imported books found. Run import-calibre first.")
+        return 0
+
+    for book in books[: args.limit]:
+        authors = ", ".join(book.get("authors") or []) or "Unknown author"
+        status = "EPUB" if book.get("preferred_epub_path") else "no EPUB"
+        print(f"{book.get('calibre_book_id')}: {book.get('title')} - {authors} [{status}]")
+        if args.verbose:
+            print(f"  UUID: {book.get('calibre_uuid')}")
+            print(f"  EPUB: {book.get('preferred_epub_path')}")
+            print(f"  Annots: {book.get('annots_key')}")
+    if len(books) > args.limit:
+        print(f"\n... {len(books) - args.limit} more")
+    return 0
+
+
+def cmd_prepare_book(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    path = prepare_book_timeline(
+        book,
+        data_dir=args.data_dir,
+        target_words=args.target_words,
+        min_words=args.min_words,
+        regions=args.regions,
+    )
+    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    print(f"Prepared book: {book.get('title')}")
+    print(f"Timeline: {path}")
+    print(f"Spine items: {len(timeline.get('spine', []))}")
+    print(f"Source units: {len(timeline.get('source_units', []))}")
+    print(f"Anchors: {len(timeline.get('anchors', []))}")
+    if args.regions:
+        print(f"Regions: {len(timeline.get('regions', []))}")
+    return 0
+
+
+def cmd_inspect_book(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    _print_book(book)
+
+    if args.anchors:
+        _print_anchor_summary(book, args.data_dir, limit=args.anchor_limit)
+
+    if args.regions:
+        _print_region_summary(book, args.data_dir, limit=args.region_limit)
+
+    if args.live:
+        print("\nLive annotation:")
+        live = read_live_annotation_for_book(book, annots_dir=args.annots_dir)
+        if not live:
+            print("  No live annotation file/position found for this book.")
+            print(f"  Expected: {(Path(args.annots_dir) if args.annots_dir else default_calibre_annots_dir()) / (book.get('annots_key') or '')}")
+            return 0
+        _print_live(live)
+
+        if args.resolve_cfi:
+            print("\nCalibre CFI probe:")
+            result = run_calibre_cfi_probe(book.get("preferred_epub_path"), live.epubcfi)
+            _print_probe_result(result)
+            if args.anchors and not result.get("error"):
+                _print_live_anchor(book, result, args.data_dir)
+            if args.regions and not result.get("error"):
+                _print_live_region(book, result, args.data_dir)
+
+    return 0
+
+
+def cmd_inspect_live(args: argparse.Namespace) -> int:
+    live = newest_live_annotation(args.annots_dir)
+    if not live:
+        print("No live Calibre annotation position found.")
+        print(f"Looked in: {Path(args.annots_dir) if args.annots_dir else default_calibre_annots_dir()}")
+        return 0
+
+    print("Newest live annotation:")
+    _print_live(live)
+
+    book = find_book_by_annots_key(live.annots_key, args.data_dir)
+    if not book:
+        print("\nNo imported book matches this annots key.")
+        print("Run import-calibre for the library containing the opened book.")
+        return 0
+
+    print("\nMatched book:")
+    _print_book(book)
+
+    if args.resolve_cfi:
+        print("\nCalibre CFI probe:")
+        result = run_calibre_cfi_probe(book.get("preferred_epub_path"), live.epubcfi)
+        _print_probe_result(result)
+
+    return 0
+
+
+def cmd_watch_live(args: argparse.Namespace) -> int:
+    fixture_dir = Path(args.fixture_dir) if args.fixture_dir else default_fixture_dir(args.data_dir)
+    last_signature = None
+    print("Watching newest Calibre viewer position. Press Ctrl+C to stop.")
+    if args.capture:
+        print("Prompt controls: [c]apture, [enter] refresh, [q]uit")
+
     try:
-        with open(timeline_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-        
-        data['calibre_id'] = calibre_id
-        
-        with open(timeline_path, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, ensure_ascii=False)
-        
-        print(f"Linked Calibre ID '{calibre_id}' to book '{book_id}'")
-        return True
-    except Exception as e:
-        print(f"Error linking: {e}")
-        return False
-
-
-class Orchestrator:
-    """
-    Main orchestrator that coordinates all components.
-    """
-    
-    def __init__(self, config_path: str = "config.json"):
-        # Load config
-        with open(config_path, 'r', encoding='utf-8') as f:
-            self.config = json.load(f)
-        
-        # Components
-        self.logger = OrchestratorLogger()
-        self.audio_engine: Optional[AudioEngine] = None
-        self.controller: Optional[Controller] = None
-        self.watcher: Optional[CalibreWatcher] = None
-        self.resolver: Optional[CalibreCFIResolver] = None
-        
-        # Scene list
-        self.scene_list = list(self.config['scene_bins'].keys())
-        
-        print("Orchestrator initialized")
-    
-    def run(self, dummy: bool = False, book_id: Optional[str] = None):
-        """
-        Run the orchestrator.
-        
-        Args:
-            dummy: Run in dummy mode (cycles through scenes without Calibre)
-            book_id: Specific book ID to watch (otherwise uses most recent)
-        """
-        if dummy:
-            self._run_dummy_mode()
-        else:
-            self._run_live_mode(book_id)
-    
-    def _run_dummy_mode(self):
-        """Run in dummy mode: cycle through chunks without Calibre."""
-        print("\n=== DUMMY MODE ===")
-        print("Cycling through chunks without Calibre integration\n")
-        
-        # Initialize audio engine
-        self.audio_engine = AudioEngine(
-            scene_bins=self.config['scene_bins'],
-            crossfade_duration=self.config['crossfade_duration_sec'],
-            fade_duration=self.config['fade_duration_sec'],
-            device=self.config.get('audio_device')
-        )
-        
-        # Initialize controller
-        self.controller = Controller(
-            scene_list=self.scene_list,
-            dwell_time_sec=self.config['dwell_time_sec'],
-            logger=self.logger
-        )
-        
-        # Start audio
-        self.audio_engine.start()
-        
-        try:
-            chunk_id = 0
-            cycle_time = self.config.get('dummy_cycle_sec', 10)
-            
-            while True:
-                # Simulate reading progress
-                confidence = 0.85  # Dummy confidence
-                
-                # Update controller
-                target_scene = self.controller.update(
-                    chunk_id=chunk_id,
-                    confidence=confidence,
-                    book_id="dummy_book"
-                )
-                
-                # Play scene if controller says so
-                if target_scene:
-                    current_scene = self.audio_engine.get_current_scene()
-                    if current_scene != target_scene:
-                        self.audio_engine.play_scene(target_scene)
-                
-                # Update status
-                self.logger.update_status(
-                    book_id="dummy_book",
-                    chunk_id=chunk_id,
-                    total_chunks=100,  # Dummy total
-                    confidence=confidence
-                )
-                
-                # Sleep
-                time.sleep(cycle_time)
-                
-                # Next chunk
-                chunk_id += 1
-        
-        except KeyboardInterrupt:
-            print("\n\nStopping...")
-        
-        finally:
-            self.audio_engine.stop()
-    
-    def _run_live_mode(self, book_id: Optional[str] = None):
-        """Run in live mode: watch Calibre and play ambience."""
-        print("\n=== LIVE MODE ===")
-        print("Watching Calibre for reading progress\n")
-        
-        # Initialize components
-        self.audio_engine = AudioEngine(
-            scene_bins=self.config['scene_bins'],
-            crossfade_duration=self.config['crossfade_duration_sec'],
-            fade_duration=self.config['fade_duration_sec'],
-            device=self.config.get('audio_device')
-        )
-        
-        self.watcher = CalibreWatcher(
-            annots_path=self.config.get('calibre_annots_path')
-        )
-        
-        # Start watcher
-        self.watcher.start()
-        
-        # Start audio
-        self.audio_engine.start()
-        
-        try:
-            current_book_id = None
-            poll_interval = 1.0  # Poll every second
-            
-            while True:
-                # Poll for new position
-                position = self.watcher.poll()
-                
-                if position:
-                    calibre_id = position['book_id']  # This is Calibre's internal hash
-                    epubcfi = position['epubcfi']
-                    
-                    # Find timeline for this Calibre ID
-                    book_id_mapping = self.config.get('book_id_mapping', {})
-                    timeline_path = find_timeline_for_calibre_id(
-                        calibre_id, 
-                        Path("data"), 
-                        book_id_mapping
-                    )
-                    
-                    if timeline_path is None:
-                        if calibre_id != current_book_id:  # Only warn once per book
-                            self.logger.print_message(
-                                f"\nNo timeline found for Calibre ID: {calibre_id[:16]}...\n"
-                                f"  To link: python main.py link {calibre_id} <book_id>\n"
-                                f"  Or preprocess the EPUB first: python main.py preprocess <epub_path>"
-                            )
-                            current_book_id = calibre_id
-                        continue
-                    
-                    # Get book_id from timeline
-                    with open(timeline_path, 'r', encoding='utf-8') as f:
-                        timeline_data = json.load(f)
-                    book_id = timeline_data.get('book_id', 'unknown')
-                    
-                    # Check if book changed
-                    if book_id != current_book_id:
-                        self.logger.print_message(f"\nSwitched to book: {book_id} (Calibre: {calibre_id[:16]}...)")
-                        current_book_id = book_id
-                        
-                        epub_path = timeline_data.get('epub_path')
-                        
-                        if not epub_path or not Path(epub_path).exists():
-                            self.logger.print_message(f"Warning: EPUB not found: {epub_path}")
-                            current_book_id = None
-                            continue
-                        
-                        # Auto-link Calibre ID to this book for future lookups
-                        if timeline_data.get('calibre_id') != calibre_id:
-                            link_calibre_to_book(calibre_id, book_id, Path("data"))
-                        
-                        # Initialize exact CFI resolver (uses Calibre's parser)
-                        self.resolver = CalibreCFIResolver(epub_path, str(timeline_path))
-                        
-                        # Initialize controller
-                        self.controller = Controller(
-                            scene_list=self.scene_list,
-                            dwell_time_sec=self.config['dwell_time_sec'],
-                            logger=self.logger,
-                            timeline=timeline_data
-                        )
-                        
-                        # Set total chunks for percentage display
-                        total_chunks = timeline_data.get('total_chunks')
-                        if total_chunks:
-                            self.controller.set_total_chunks(total_chunks)
-                        
-                        self.logger.update_status(book_id=book_id, total_chunks=total_chunks)
-                    
-                    # Resolve CFI to chunk using exact resolver
-                    if self.resolver:
-                        result = self.resolver.resolve(epubcfi)
-                        
-                        if result is not None:
-                            chunk_id = result.chunk_id
-                            confidence = result.confidence
-                            
-                            # Update controller
-                            target_scene = self.controller.update(
-                                chunk_id=chunk_id,
-                                confidence=confidence,
-                                book_id=current_book_id
-                            )
-                            
-                            # Play scene if controller says so
-                            if target_scene:
-                                current_scene = self.audio_engine.get_current_scene()
-                                if current_scene != target_scene:
-                                    self.audio_engine.play_scene(target_scene)
-                
-                # Sleep
-                time.sleep(poll_interval)
-        
-        except KeyboardInterrupt:
-            print("\n\nStopping...")
-        
-        finally:
-            self.audio_engine.stop()
-            self.watcher.stop()
-
-
-def main():
-    """Main CLI entry point."""
-    parser = argparse.ArgumentParser(
-        description="EPUB Ambience Orchestrator v1",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Commands:
-  preprocess <epub_path>    Preprocess an EPUB file
-  score_ml <book_id>        Run ML scene scoring on a preprocessed book
-  run [--dummy]             Run the orchestrator
-  link <calibre_id> <book_id>  Link Calibre annots ID to a book
-  list                      List all preprocessed books
-
-Examples:
-  python main.py preprocess mybook.epub
-  python main.py preprocess mybook.epub --ml
-  python main.py score_ml B0C5S477SF
-  python main.py score_ml B0C5S477SF --force
-  python main.py run
-  python main.py run --dummy
-  python main.py link abc123def B0C5S477SF
-  python main.py list
-        """
-    )
-    
-    parser.add_argument(
-        'command',
-        choices=['preprocess', 'score_ml', 'run', 'link', 'list'],
-        help='Command to execute'
-    )
-    
-    parser.add_argument(
-        'args',
-        nargs='*',
-        help='Command arguments'
-    )
-    
-    parser.add_argument(
-        '--dummy',
-        action='store_true',
-        help='Run in dummy mode (cycles through scenes)'
-    )
-    
-    parser.add_argument(
-        '--book-id',
-        type=str,
-        help='Specific book ID to watch'
-    )
-    
-    parser.add_argument(
-        '--config',
-        type=str,
-        default='config.json',
-        help='Path to config file (default: config.json)'
-    )
-    
-    parser.add_argument(
-        '--ml',
-        action='store_true',
-        help='Run ML scene scoring after preprocessing'
-    )
-    
-    parser.add_argument(
-        '--force',
-        action='store_true',
-        help='Force ML recomputation even if results exist'
-    )
-    
-    parser.add_argument(
-        '--model',
-        type=str,
-        default='facebook/bart-large-mnli',
-        help='HuggingFace model for zero-shot classification (default: facebook/bart-large-mnli)'
-    )
-    
-    parser.add_argument(
-        '--batch-size',
-        type=int,
-        default=8,
-        help='Batch size for ML inference (default: 8)'
-    )
-    
-    args = parser.parse_args()
-    
-    # Execute command
-    if args.command == 'preprocess':
-        if not args.args:
-            print("Error: epub_path required for preprocess command")
-            print("Usage: python main.py preprocess <epub_path> [--ml] [--force]")
-            sys.exit(1)
-        
-        epub_path = args.args[0]
-        print(f"Preprocessing: {epub_path}\n")
-        timeline_path = preprocess_epub(epub_path, run_ml=args.ml, ml_force=args.force)
-        print(f"\nDone! Timeline saved to: {timeline_path}")
-    
-    elif args.command == 'score_ml':
-        if not args.args:
-            print("Error: book_id required for score_ml command")
-            print("Usage: python main.py score_ml <book_id> [--force] [--model MODEL]")
-            sys.exit(1)
-        
-        book_id = args.args[0]
-        print(f"Running ML scene scoring for: {book_id}\n")
-        
-        from src.ml_scene import score_ml_from_book_id
-        try:
-            summary = score_ml_from_book_id(
-                book_id=book_id,
-                model_name=args.model,
-                batch_size=args.batch_size,
-                force=args.force
+        while True:
+            live, book, result = current_live_probe(
+                data_dir=args.data_dir,
+                annots_dir=args.annots_dir,
+                probe_runner=run_calibre_cfi_probe if args.resolve_cfi else _no_probe,
             )
-            print(f"\nDone! Summary saved to: data/{book_id}/ml_summary.json")
-        except FileNotFoundError as e:
-            print(f"Error: {e}")
-            sys.exit(1)
-        except Exception as e:
-            print(f"Error during ML scoring: {e}")
-            sys.exit(1)
-    
-    elif args.command == 'link':
-        if len(args.args) < 2:
-            print("Error: calibre_id and book_id required for link command")
-            print("Usage: python main.py link <calibre_id> <book_id>")
-            print("\nTo find your Calibre ID, run the orchestrator and it will show")
-            print("the ID when it detects a book without a linked timeline.")
-            sys.exit(1)
-        
-        calibre_id = args.args[0]
-        book_id = args.args[1]
-        
-        if link_calibre_to_book(calibre_id, book_id, Path("data")):
-            print(f"\nSuccess! Calibre ID '{calibre_id}' is now linked to book '{book_id}'")
-        else:
-            sys.exit(1)
-    
-    elif args.command == 'list':
-        data_dir = Path("data")
-        if not data_dir.exists():
-            print("No preprocessed books found (data/ directory doesn't exist)")
-            sys.exit(0)
-        
-        print("\nPreprocessed books:\n")
-        for subdir in sorted(data_dir.iterdir()):
-            if subdir.is_dir():
-                timeline_path = subdir / "timeline.json"
-                if timeline_path.exists():
-                    try:
-                        with open(timeline_path, 'r', encoding='utf-8') as f:
-                            data = json.load(f)
-                        book_id = data.get('book_id', subdir.name)
-                        calibre_id = data.get('calibre_id', '(not linked)')
-                        epub_path = data.get('epub_path', '?')
-                        chunks = data.get('total_chunks', '?')
-                        print(f"  {book_id}")
-                        print(f"    Calibre ID: {calibre_id}")
-                        print(f"    Chunks: {chunks}")
-                        print(f"    EPUB: {epub_path}")
-                        print()
-                    except Exception as e:
-                        print(f"  {subdir.name}: (error reading timeline: {e})")
-    
-    elif args.command == 'run':
-        orchestrator = Orchestrator(config_path=args.config)
-        orchestrator.run(dummy=args.dummy, book_id=args.book_id)
+            signature = (
+                live.annots_key if live else None,
+                live.epubcfi if live else None,
+                result.get("href") if result else None,
+                result.get("local_char_offset") if result else None,
+            )
+            if args.always or signature != last_signature:
+                print("\n" + "-" * 72)
+                if not live:
+                    print("No live Calibre annotation position found.")
+                else:
+                    _print_live(live)
+                    if book:
+                        print("\nMatched book:")
+                        _print_book(book)
+                    else:
+                        print("\nNo imported book matches this annots key.")
+                    if result:
+                        print("\nCalibre CFI probe:")
+                        _print_probe_result(result)
+                last_signature = signature
+
+            if args.capture:
+                choice = input("\n[c]apture [enter] refresh [q]uit > ").strip().lower()
+                if choice == "q":
+                    return 0
+                if choice == "c":
+                    if not live or not book or not result:
+                        print("Nothing capturable yet.")
+                    elif result.get("error"):
+                        print(f"Cannot capture failed probe: {result['error']}")
+                    else:
+                        name = input("Fixture name (blank for timestamp): ").strip() or timestamp_name("cfi")
+                        path = capture_live_fixture(
+                            name=name,
+                            live=live,
+                            book=book,
+                            resolved=result,
+                            fixture_dir=fixture_dir,
+                            confirmed=args.confirmed,
+                        )
+                        print(f"Captured fixture: {path}")
+            else:
+                from src.cfi_fixtures import sleep_until_next
+
+                sleep_until_next(args.interval)
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
 
 
-if __name__ == '__main__':
-    main()
+def cmd_cfi_fixtures(args: argparse.Namespace) -> int:
+    fixture_dir = Path(args.fixture_dir) if args.fixture_dir else default_fixture_dir(args.data_dir)
+    if args.fixture_command == "list":
+        paths = sorted(fixture_dir.glob("*.json"))
+        if not paths:
+            print(f"No fixtures found in {fixture_dir}")
+            return 0
+        for path in paths:
+            print(path)
+        return 0
+
+    if args.fixture_command == "check":
+        results = check_fixtures(
+            fixture_dir,
+            strict_hash=args.strict_hash,
+            check_anchors=args.anchors,
+            data_dir=args.data_dir,
+        )
+        if not results:
+            print(f"No fixtures found in {fixture_dir}")
+            return 0
+        failures = 0
+        for result in results:
+            status = "PASS" if result["ok"] else "FAIL"
+            print(f"{status} {result['name']} ({result['path']})")
+            for warning in result.get("warnings", []):
+                print(f"  - warning: {warning}")
+            for failure in result["failures"]:
+                print(f"  - {failure}")
+            if args.anchors and result.get("anchor"):
+                anchor = result["anchor"]
+                pos = anchor["position"]
+                print(
+                    f"  anchor: {anchor['anchor_id']} "
+                    f"spine={pos['spine_index']} "
+                    f"offsets={pos['start_local_offset']}-{pos['end_local_offset']}"
+                )
+            if not result["ok"]:
+                failures += 1
+        print(f"\n{len(results) - failures}/{len(results)} fixtures passed")
+        return 1 if failures else 0
+
+    raise ValueError(f"Unknown cfi-fixtures command: {args.fixture_command}")
+
+
+def cmd_annots_key(args: argparse.Namespace) -> int:
+    print(compute_annots_key(args.epub_path))
+    return 0
+
+
+def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
+    return {"cfi": epubcfi, "probe_skipped": True}
+
+
+def _print_book(book: dict[str, Any]) -> None:
+    authors = ", ".join(book.get("authors") or []) or "Unknown author"
+    print(f"Book: {book.get('title')} - {authors}")
+    print(f"  Calibre id: {book.get('calibre_book_id')}")
+    print(f"  UUID: {book.get('calibre_uuid')}")
+    print(f"  Library: {book.get('library_path')}")
+    print(f"  EPUB: {book.get('preferred_epub_path')}")
+    print(f"  Annots key: {book.get('annots_key')}")
+
+
+def _print_live(live: Any) -> None:
+    print(f"  Annots file: {live.annots_path}")
+    print(f"  Annots key: {live.annots_key}")
+    print(f"  CFI: {live.epubcfi}")
+    print(f"  Timestamp: {live.timestamp}")
+
+
+def _print_probe_result(result: dict[str, Any]) -> None:
+    if result.get("error"):
+        print(f"  Error: {result['error']}")
+    for key in ("spine_index", "href", "local_char_offset", "spine_text_len"):
+        if key in result:
+            print(f"  {key}: {result[key]}")
+    if result.get("text_preview"):
+        print(f"  text_preview: {result['text_preview']}")
+    if result.get("_stderr_tail"):
+        print("  Helper log tail:")
+        for line in result["_stderr_tail"].splitlines():
+            print(f"    {line}")
+
+
+def _print_anchor_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -> None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    print("\nAnchor timeline:")
+    if not path.exists():
+        print(f"  No timeline found. Run: python main.py prepare-book \"{book.get('title')}\"")
+        return
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    print(f"  Path: {path}")
+    print(f"  Spine items: {len(timeline.get('spine', []))}")
+    print(f"  Anchors: {len(timeline.get('anchors', []))}")
+    for anchor in timeline.get("anchors", [])[:limit]:
+        pos = anchor["position"]
+        text = anchor["text"]
+        print(
+            f"  #{anchor['anchor_id']} spine={pos['spine_index']} "
+            f"{pos['start_local_offset']}-{pos['end_local_offset']} "
+            f"words={text['word_count']} {text['preview']}"
+        )
+
+
+def _print_region_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -> None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    print("\nRegions:")
+    if not path.exists():
+        print(f"  No timeline found. Run: python main.py prepare-book \"{book.get('title')}\" --regions")
+        return
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    anchors = timeline.get("anchors", [])
+    regions = timeline.get("regions", [])
+    if anchors and not regions:
+        print("  Warning: timeline has anchors but no regions. Run prepare-book with --regions.")
+        return
+    print(f"  Count: {len(regions)}")
+    for region in regions[:limit]:
+        boundary_in = ", ".join(region.get("boundary_in", {}).get("reasons", [])) or "none"
+        boundary_out = ", ".join(region.get("boundary_out", {}).get("reasons", [])) or "none"
+        stats = region.get("stats", {})
+        print(
+            f"  #{region['region_id']} anchors={region['anchor_start']}-{region['anchor_end']} "
+            f"source_units={region['source_unit_start']}-{region['source_unit_end']} "
+            f"anchors_count={stats.get('anchor_count')} words={stats.get('word_count')}"
+        )
+        print(f"     in: {boundary_in}")
+        print(f"     out: {boundary_out}")
+        print(f"     preview: {region.get('preview', '')}")
+
+
+def _print_live_anchor(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    print("\nActive anchor:")
+    if not path.exists():
+        print("  No prepared timeline.")
+        return
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    anchor = find_anchor_for_position(timeline, result["spine_index"], result["local_char_offset"])
+    if not anchor:
+        print("  No anchor found for resolved CFI position.")
+        return
+    pos = anchor["position"]
+    text = anchor["text"]
+    print(
+        f"  #{anchor['anchor_id']} spine={pos['spine_index']} "
+        f"offsets={pos['start_local_offset']}-{pos['end_local_offset']} "
+        f"words={text['word_count']}"
+    )
+    print(f"  preview: {text['preview']}")
+
+
+def _print_live_region(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    print("\nActive region:")
+    if not path.exists():
+        print("  No prepared timeline.")
+        return
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    anchor = find_anchor_for_position(timeline, result["spine_index"], result["local_char_offset"])
+    if not anchor:
+        print("  No anchor found for resolved CFI position.")
+        return
+    if not timeline.get("regions"):
+        print("  Warning: active anchor found, but timeline has no regions.")
+        return
+    region = find_region_for_anchor(timeline, anchor["anchor_id"])
+    if not region:
+        print("  No region found for active anchor.")
+        return
+    boundary_in = ", ".join(region.get("boundary_in", {}).get("reasons", [])) or "none"
+    boundary_out = ", ".join(region.get("boundary_out", {}).get("reasons", [])) or "none"
+    print(
+        f"  #{region['region_id']} anchors={region['anchor_start']}-{region['anchor_end']} "
+        f"active_anchor={anchor['anchor_id']}"
+    )
+    print(f"  in: {boundary_in}")
+    print(f"  out: {boundary_out}")
+    print(f"  preview: {region.get('preview', '')}")
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = argparse.ArgumentParser(
+        description="Calibre-native adaptive ambience tooling",
+    )
+    parser.add_argument("--data-dir", default="data", help="Cache/data directory")
+    sub = parser.add_subparsers(dest="command", required=True)
+
+    p = sub.add_parser("import-calibre", help="Import a Calibre library manifest")
+    p.add_argument("library_path")
+    p.add_argument("--limit", type=int, default=5, help="Sample rows to print")
+    p.set_defaults(func=cmd_import_calibre)
+
+    p = sub.add_parser("list-books", help="List imported Calibre books")
+    p.add_argument("query", nargs="?")
+    p.add_argument("--limit", type=int, default=50)
+    p.add_argument("--epub-only", action="store_true")
+    p.add_argument("--verbose", action="store_true")
+    p.set_defaults(func=cmd_list_books)
+
+    p = sub.add_parser("prepare-book", help="Prepare anchor timeline for one imported book")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--target-words", type=int, default=350)
+    p.add_argument("--min-words", type=int, default=180)
+    p.add_argument("--regions", action="store_true", help="Build deterministic region records")
+    p.set_defaults(func=cmd_prepare_book)
+
+    p = sub.add_parser("inspect-book", help="Inspect an imported book")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--live", action="store_true", help="Read this book's live viewer annots file")
+    p.add_argument("--resolve-cfi", action="store_true", help="Resolve live CFI with calibre-debug helper")
+    p.add_argument("--anchors", action="store_true", help="Show prepared anchor timeline info")
+    p.add_argument("--regions", action="store_true", help="Show prepared region timeline info")
+    p.add_argument("--anchor-limit", type=int, default=5)
+    p.add_argument("--region-limit", type=int, default=5)
+    p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.set_defaults(func=cmd_inspect_book)
+
+    p = sub.add_parser("inspect-live", help="Inspect newest live Calibre viewer position")
+    p.add_argument("--resolve-cfi", action="store_true", help="Resolve live CFI with calibre-debug helper")
+    p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.set_defaults(func=cmd_inspect_live)
+
+    p = sub.add_parser("watch-live", help="Watch live Calibre viewer position")
+    p.add_argument("--resolve-cfi", action="store_true", help="Resolve live CFI with calibre-debug helper")
+    p.add_argument("--capture", action="store_true", help="Prompt to capture CFI fixtures")
+    p.add_argument("--confirmed", action="store_true", help="Mark captured fixtures as visually confirmed")
+    p.add_argument("--fixture-dir", help="Directory for captured CFI fixtures")
+    p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.add_argument("--interval", type=float, default=1.0)
+    p.add_argument("--always", action="store_true", help="Print every poll instead of only changes")
+    p.set_defaults(func=cmd_watch_live)
+
+    p = sub.add_parser("cfi-fixtures", help="Manage captured CFI fixtures")
+    p.add_argument("fixture_command", choices=["list", "check"])
+    p.add_argument("--fixture-dir", help="Directory containing CFI fixtures")
+    p.add_argument("--strict-hash", action="store_true", help="Fail checks when EPUB file hash changed")
+    p.add_argument("--anchors", action="store_true", help="Also require fixtures to map to prepared anchors")
+    p.set_defaults(func=cmd_cfi_fixtures)
+
+    p = sub.add_parser("annots-key", help="Compute Calibre viewer annots filename for an EPUB path")
+    p.add_argument("epub_path")
+    p.set_defaults(func=cmd_annots_key)
+
+    return parser
+
+
+def main() -> int:
+    parser = build_parser()
+    args = parser.parse_args()
+    try:
+        return args.func(args)
+    except (FileNotFoundError, LookupError, ValueError) as exc:
+        print(f"Error: {exc}", file=sys.stderr)
+        return 1
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

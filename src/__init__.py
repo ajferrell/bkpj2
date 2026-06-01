@@ -1,22 +1,33 @@
-"""
-EPUB Ambience Orchestrator - Core modules.
-"""
+"""Calibre-native adaptive ambience core."""
 
-from .audio_engine import AudioEngine
-from .controller import Controller
-from .logger import OrchestratorLogger
-from .watcher import CalibreWatcher
-from .preprocessor import preprocess_epub
-from .resolver_calibre import CalibreCFIResolver
-from .chunk_index import ChunkIndex, load_chunk_index
+from .calibre_native import (
+    CalibreBook,
+    LiveAnnotation,
+    compute_annots_key,
+    default_calibre_annots_dir,
+    find_book,
+    find_book_by_annots_key,
+    import_calibre_library,
+    newest_live_annotation,
+    read_live_annotation_for_book,
+)
+from .anchors import (
+    build_anchors_from_spine,
+    find_anchor_for_position,
+    prepare_book_timeline,
+)
 
 __all__ = [
-    'AudioEngine',
-    'Controller', 
-    'OrchestratorLogger',
-    'CalibreWatcher',
-    'preprocess_epub',
-    'CalibreCFIResolver',
-    'ChunkIndex',
-    'load_chunk_index',
+    "CalibreBook",
+    "LiveAnnotation",
+    "compute_annots_key",
+    "default_calibre_annots_dir",
+    "find_book",
+    "find_book_by_annots_key",
+    "import_calibre_library",
+    "newest_live_annotation",
+    "read_live_annotation_for_book",
+    "build_anchors_from_spine",
+    "find_anchor_for_position",
+    "prepare_book_timeline",
 ]

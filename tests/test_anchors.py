@@ -1,0 +1,269 @@
+import uuid
+from pathlib import Path
+
+from src.anchors import (
+    BoundaryProvider,
+    DEFAULT_REGION_CONFIG,
+    build_regions,
+    build_anchors_from_spine,
+    extract_anchor_features,
+    extract_source_units,
+    find_anchor_for_position,
+    find_region_for_anchor,
+    load_timeline,
+    paragraph_spans,
+    prepare_book_timeline,
+)
+
+
+def scratch_path() -> Path:
+    path = Path(".test_tmp") / uuid.uuid4().hex
+    path.mkdir(parents=True, exist_ok=False)
+    return path
+
+
+def test_paragraph_spans_preserve_offsets():
+    text = "One two.\n\nThree four five.\n\nSix."
+    spans = paragraph_spans(text)
+
+    assert spans[0]["start"] == 0
+    assert spans[0]["end"] == len("One two.")
+    assert spans[1]["text"] == "Three four five."
+    assert spans[1]["word_count"] == 3
+
+
+def test_source_units_preserve_order_and_offsets():
+    spine = [
+        {
+            "spine_index": 0,
+            "href": "one.xhtml",
+            "text": "One two.\n\nThree four five.",
+        },
+        {
+            "spine_index": 1,
+            "href": "two.xhtml",
+            "text": "Six seven.",
+        },
+    ]
+
+    units = extract_source_units(spine)
+
+    assert [unit["unit_id"] for unit in units] == [0, 1, 2]
+    assert [unit["href"] for unit in units] == ["one.xhtml", "one.xhtml", "two.xhtml"]
+    assert units[0]["start_local_offset"] == 0
+    assert units[0]["end_local_offset"] == len("One two.")
+    assert units[2]["start_local_offset"] == 0
+    assert units[2]["kind"] == "paragraph"
+
+
+def test_build_anchors_groups_paragraphs_and_finds_offset():
+    spine = [
+        {
+            "spine_index": 2,
+            "href": "chapter.xhtml",
+            "text": "one two three.\n\nfour five six.\n\nseven eight nine.\n\nlast bit.",
+            "text_len": 62,
+        }
+    ]
+
+    anchors = build_anchors_from_spine(spine, target_words=6, min_words=3)
+    assert len(anchors) == 2
+    assert anchors[0]["position"]["spine_index"] == 2
+    assert anchors[0]["text"]["word_count"] == 6
+
+    timeline = {"anchors": anchors}
+    anchor = find_anchor_for_position(timeline, spine_index=2, local_char_offset=spine[0]["text"].index("seven"))
+    assert anchor is not None
+    assert anchor["anchor_id"] == 1
+
+
+def test_anchors_cover_contiguous_source_units_without_gaps():
+    spine = [
+        {
+            "spine_index": 0,
+            "href": "chapter.xhtml",
+            "text": "one two.\n\nthree four.\n\nfive six.\n\nseven eight.",
+        }
+    ]
+
+    anchors = build_anchors_from_spine(spine, target_words=2, min_words=1)
+
+    assert [(a["source_unit_start"], a["source_unit_end"]) for a in anchors] == [
+        (0, 1),
+        (1, 2),
+        (2, 3),
+        (3, 4),
+    ]
+
+
+def test_prepare_book_timeline_with_fake_extractor():
+    tmp_path = scratch_path()
+    epub = tmp_path / "book.epub"
+    epub.write_bytes(b"fake epub")
+    book = {
+        "calibre_book_id": 42,
+        "calibre_uuid": "uuid-42",
+        "title": "Book",
+        "authors": ["Author"],
+        "preferred_epub_path": str(epub),
+        "annots_key": "abc.json",
+    }
+
+    def fake_extractor(epub_path):
+        assert epub_path == str(epub)
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "Alpha beta gamma.\n\nDelta epsilon zeta.",
+                "text_len": 39,
+            }
+        ]
+
+    path = prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=6,
+        min_words=3,
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 42)
+
+    assert path.exists()
+    assert timeline["book"]["title"] == "Book"
+    assert len(timeline["source_units"]) == 2
+    assert len(timeline["anchors"]) == 1
+    assert timeline["anchors"][0]["source_unit_start"] == 0
+    assert timeline["anchors"][0]["source_unit_end"] == 2
+    assert timeline["anchors"][0]["text"]["word_count"] == 6
+
+
+def test_prepare_book_timeline_can_write_regions():
+    tmp_path = scratch_path()
+    epub = tmp_path / "book.epub"
+    epub.write_bytes(b"fake epub")
+    book = {
+        "calibre_book_id": 43,
+        "calibre_uuid": "uuid-43",
+        "title": "Book",
+        "authors": ["Author"],
+        "preferred_epub_path": str(epub),
+        "annots_key": "abc.json",
+    }
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} rain." for i in range(5)),
+            },
+            {
+                "spine_index": 1,
+                "href": "chapter2.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} sword." for i in range(5)),
+            },
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=3,
+        min_words=1,
+        regions=True,
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 43)
+
+    assert timeline["regions"]
+    assert timeline["regions"][0]["boundary_in"]["reasons"] == ["book_start"]
+
+
+def test_region_ranges_cover_all_anchors_exactly_once_and_enforce_maximum():
+    spine = [
+        {
+            "spine_index": 0,
+            "href": "chapter.xhtml",
+            "text": "\n\n".join(f"Paragraph {i}." for i in range(10)),
+        }
+    ]
+    anchors = build_anchors_from_spine(spine, target_words=2, min_words=1)
+    features = extract_anchor_features(anchors)
+    candidates = BoundaryProvider().score_boundaries(
+        extract_source_units(spine),
+        anchors,
+        features,
+        DEFAULT_REGION_CONFIG,
+    )
+    result = build_regions(
+        anchors,
+        candidates,
+        {"min_anchors": 3, "target_anchors": 3, "max_anchors": 4, "boundary_threshold": 99},
+    )
+
+    covered = []
+    for region in result["regions"]:
+        covered.extend(range(region["anchor_start"], region["anchor_end"]))
+        assert region["stats"]["anchor_count"] <= 4
+
+    assert covered == list(range(len(anchors)))
+    internal_lengths = [
+        region["stats"]["anchor_count"]
+        for region in result["regions"][:-1]
+    ]
+    assert all(length >= 3 for length in internal_lengths)
+
+
+def test_live_anchor_lookup_maps_to_expected_region():
+    spine = [
+        {
+            "spine_index": 0,
+            "href": "chapter.xhtml",
+            "text": "\n\n".join(f"Paragraph {i} forest." for i in range(6)),
+        },
+        {
+            "spine_index": 1,
+            "href": "next.xhtml",
+            "text": "\n\n".join(f"Paragraph {i} battle." for i in range(6)),
+        },
+    ]
+    source_units = extract_source_units(spine)
+    anchors = build_anchors_from_spine(spine, target_words=3, min_words=1)
+    features = extract_anchor_features(anchors)
+    candidates = BoundaryProvider().score_boundaries(source_units, anchors, features, DEFAULT_REGION_CONFIG)
+    regions = build_regions(anchors, candidates, DEFAULT_REGION_CONFIG)["regions"]
+    timeline = {"anchors": anchors, "regions": regions}
+
+    offset = spine[1]["text"].index("Paragraph 1")
+    anchor = find_anchor_for_position(timeline, spine_index=1, local_char_offset=offset)
+    region = find_region_for_anchor(timeline, anchor["anchor_id"])
+
+    assert anchor is not None
+    assert region is not None
+    assert region["anchor_start"] <= anchor["anchor_id"] < region["anchor_end"]
+
+
+def test_chapter_boundary_reason_appears_in_deterministic_fixture():
+    spine = [
+        {
+            "spine_index": 0,
+            "href": "one.xhtml",
+            "text": "one.\n\ntwo.\n\nthree.",
+        },
+        {
+            "spine_index": 1,
+            "href": "two.xhtml",
+            "text": "four.\n\nfive.\n\nsix.",
+        },
+    ]
+    source_units = extract_source_units(spine)
+    anchors = build_anchors_from_spine(spine, target_words=1, min_words=1)
+    features = extract_anchor_features(anchors)
+    candidates = BoundaryProvider().score_boundaries(source_units, anchors, features, DEFAULT_REGION_CONFIG)
+    regions = build_regions(anchors, candidates, DEFAULT_REGION_CONFIG)["regions"]
+
+    assert any(
+        "chapter_start" in region["boundary_in"]["reasons"]
+        or "chapter_start" in region["boundary_out"]["reasons"]
+        for region in regions
+    )
