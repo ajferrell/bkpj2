@@ -36,13 +36,3 @@ Calibre library EPUB path
 
 Semantic labels, audio scores, and the adaptive mixer are intentionally still
 future stages.
-
-## Docs
-
-See:
-
-- [Usage](docs/USAGE.md) for setup, commands, and validation.
-- [Architecture](docs/ARCHITECTURE.md) for the broad product design.
-- [Region design](docs/DESIGN.md) for the current segmentation design.
-- [Preparation cache shape](docs/PREP_CACHE_DESIGN.md) for the next cache cleanup.
-- [Next slice](docs/NEXT.md) for the active implementation handoff.
