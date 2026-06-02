@@ -12,7 +12,7 @@ from typing import Any, Optional
 from .cfi_fixtures import file_sha256
 
 
-TIMELINE_SCHEMA_VERSION = 2
+TIMELINE_SCHEMA_VERSION = 3
 
 DEFAULT_REGION_CONFIG = {
     "min_anchors": 3,
@@ -66,12 +66,17 @@ def timeline_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return timeline_dir(data_dir, calibre_book_id) / "timeline.json"
 
 
+def inspect_text_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return timeline_dir(data_dir, calibre_book_id) / "inspect_text.json"
+
+
 def prepare_book_timeline(
     book: dict[str, Any],
     data_dir: str | Path = "data",
     target_words: int = 350,
     min_words: int = 180,
     regions: bool = False,
+    debug_text: bool = False,
     region_config: Optional[dict[str, Any]] = None,
     spine_extractor= None,
 ) -> Path:
@@ -116,17 +121,29 @@ def prepare_book_timeline(
         "anchors": anchors,
         "features": features,
     }
+    boundary_candidates: list[dict[str, Any]] = []
     if regions:
         provider = BoundaryProvider()
-        candidates = provider.score_boundaries(source_units, anchors, features, config)
-        result = build_regions(anchors, candidates, config)
+        boundary_candidates = provider.score_boundaries(source_units, anchors, features, config)
+        result = build_regions(anchors, boundary_candidates, config)
         timeline["regions"] = result["regions"]
 
     out_dir = timeline_dir(data_dir, book["calibre_book_id"])
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "timeline.json"
     with open(path, "w", encoding="utf-8") as f:
-        json.dump(timeline, f, indent=2, ensure_ascii=False)
+        json.dump(slim_timeline(timeline), f, indent=2, ensure_ascii=False)
+    sidecar_path = inspect_text_path(data_dir, book["calibre_book_id"])
+    if debug_text:
+        with open(sidecar_path, "w", encoding="utf-8") as f:
+            json.dump(
+                inspect_text_sidecar(source_units, anchors, boundary_candidates),
+                f,
+                indent=2,
+                ensure_ascii=False,
+            )
+    elif sidecar_path.exists():
+        sidecar_path.unlink()
     return path
 
 
@@ -134,6 +151,41 @@ def load_timeline(data_dir: str | Path, calibre_book_id: int | str) -> dict[str,
     path = timeline_path(data_dir, calibre_book_id)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def remove_timeline(data_dir: str | Path, calibre_book_id: int | str) -> bool:
+    path = timeline_path(data_dir, calibre_book_id)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def remove_inspect_text(data_dir: str | Path, calibre_book_id: int | str) -> bool:
+    path = inspect_text_path(data_dir, calibre_book_id)
+    if not path.exists():
+        return False
+    path.unlink()
+    return True
+
+
+def remove_regions_from_timeline(data_dir: str | Path, calibre_book_id: int | str) -> bool:
+    path = timeline_path(data_dir, calibre_book_id)
+    if not path.exists():
+        return False
+    timeline = load_timeline(data_dir, calibre_book_id)
+    changed = False
+    if "regions" in timeline:
+        timeline.pop("regions")
+        changed = True
+    builder = timeline.setdefault("builder", {})
+    if builder.get("regions") is not False:
+        builder["regions"] = False
+        changed = True
+    if changed:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump(timeline, f, indent=2, ensure_ascii=False)
+    return changed
 
 
 def extract_spine_texts_with_calibre(epub_path: str | Path) -> list[dict[str, Any]]:
@@ -194,6 +246,51 @@ def extract_source_units(spine: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def serialize_source_unit(unit: dict[str, Any]) -> dict[str, Any]:
     return {key: value for key, value in unit.items() if not key.startswith("_")}
+
+
+def slim_timeline(timeline: dict[str, Any]) -> dict[str, Any]:
+    slim = dict(timeline)
+    slim["source_units"] = [
+        serialize_source_unit(unit)
+        for unit in timeline.get("source_units", [])
+    ]
+    slim["anchors"] = [
+        slim_anchor(anchor)
+        for anchor in timeline.get("anchors", [])
+    ]
+    return slim
+
+
+def slim_anchor(anchor: dict[str, Any]) -> dict[str, Any]:
+    slim = dict(anchor)
+    text = dict(anchor.get("text", {}))
+    text.pop("plain", None)
+    slim["text"] = text
+    return slim
+
+
+def inspect_text_sidecar(
+    source_units: list[dict[str, Any]],
+    anchors: list[dict[str, Any]],
+    boundary_candidates: list[dict[str, Any]] | None = None,
+) -> dict[str, Any]:
+    sidecar: dict[str, Any] = {
+        "anchors": {
+            str(anchor["anchor_id"]): {
+                "plain": anchor.get("text", {}).get("plain", ""),
+            }
+            for anchor in anchors
+        },
+        "source_units": {
+            str(unit["unit_id"]): {
+                "text": unit.get("_text", ""),
+            }
+            for unit in source_units
+        },
+    }
+    if boundary_candidates:
+        sidecar["boundary_candidates"] = boundary_candidates
+    return sidecar
 
 
 def build_anchors(

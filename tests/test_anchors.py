@@ -1,3 +1,4 @@
+import json
 import uuid
 from pathlib import Path
 
@@ -10,9 +11,14 @@ from src.anchors import (
     extract_source_units,
     find_anchor_for_position,
     find_region_for_anchor,
+    inspect_text_path,
     load_timeline,
     paragraph_spans,
     prepare_book_timeline,
+    remove_inspect_text,
+    remove_regions_from_timeline,
+    remove_timeline,
+    timeline_path,
 )
 
 
@@ -20,6 +26,19 @@ def scratch_path() -> Path:
     path = Path(".test_tmp") / uuid.uuid4().hex
     path.mkdir(parents=True, exist_ok=False)
     return path
+
+
+def fake_book(tmp_path: Path, calibre_book_id: int = 42) -> dict:
+    epub = tmp_path / "book.epub"
+    epub.write_bytes(b"fake epub")
+    return {
+        "calibre_book_id": calibre_book_id,
+        "calibre_uuid": f"uuid-{calibre_book_id}",
+        "title": "Book",
+        "authors": ["Author"],
+        "preferred_epub_path": str(epub),
+        "annots_key": "abc.json",
+    }
 
 
 def test_paragraph_spans_preserve_offsets():
@@ -98,19 +117,10 @@ def test_anchors_cover_contiguous_source_units_without_gaps():
 
 def test_prepare_book_timeline_with_fake_extractor():
     tmp_path = scratch_path()
-    epub = tmp_path / "book.epub"
-    epub.write_bytes(b"fake epub")
-    book = {
-        "calibre_book_id": 42,
-        "calibre_uuid": "uuid-42",
-        "title": "Book",
-        "authors": ["Author"],
-        "preferred_epub_path": str(epub),
-        "annots_key": "abc.json",
-    }
+    book = fake_book(tmp_path, 42)
 
     def fake_extractor(epub_path):
-        assert epub_path == str(epub)
+        assert epub_path == book["preferred_epub_path"]
         return [
             {
                 "spine_index": 0,
@@ -130,26 +140,53 @@ def test_prepare_book_timeline_with_fake_extractor():
     timeline = load_timeline(tmp_path / "data", 42)
 
     assert path.exists()
+    assert timeline["schema_version"] == 3
     assert timeline["book"]["title"] == "Book"
     assert len(timeline["source_units"]) == 2
     assert len(timeline["anchors"]) == 1
     assert timeline["anchors"][0]["source_unit_start"] == 0
     assert timeline["anchors"][0]["source_unit_end"] == 2
     assert timeline["anchors"][0]["text"]["word_count"] == 6
+    assert "plain" not in timeline["anchors"][0]["text"]
+    assert "_text" not in timeline["source_units"][0]
+    assert not inspect_text_path(tmp_path / "data", 42).exists()
+
+
+def test_prepare_book_timeline_debug_text_writes_sidecar():
+    tmp_path = scratch_path()
+    book = fake_book(tmp_path, 44)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "Alpha beta gamma.\n\nDelta epsilon zeta.",
+            }
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=6,
+        min_words=3,
+        debug_text=True,
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 44)
+    sidecar = inspect_text_path(tmp_path / "data", 44)
+
+    assert sidecar.exists()
+    assert "plain" not in timeline["anchors"][0]["text"]
+    assert "_text" not in timeline["source_units"][0]
+    data = json.loads(sidecar.read_text(encoding="utf-8"))
+    assert data["anchors"]["0"]["plain"] == "Alpha beta gamma.\n\nDelta epsilon zeta."
+    assert data["source_units"]["0"]["text"] == "Alpha beta gamma."
 
 
 def test_prepare_book_timeline_can_write_regions():
     tmp_path = scratch_path()
-    epub = tmp_path / "book.epub"
-    epub.write_bytes(b"fake epub")
-    book = {
-        "calibre_book_id": 43,
-        "calibre_uuid": "uuid-43",
-        "title": "Book",
-        "authors": ["Author"],
-        "preferred_epub_path": str(epub),
-        "annots_key": "abc.json",
-    }
+    book = fake_book(tmp_path, 43)
 
     def fake_extractor(epub_path):
         return [
@@ -177,6 +214,41 @@ def test_prepare_book_timeline_can_write_regions():
 
     assert timeline["regions"]
     assert timeline["regions"][0]["boundary_in"]["reasons"] == ["book_start"]
+
+
+def test_prepare_book_timeline_debug_text_includes_boundary_candidates():
+    tmp_path = scratch_path()
+    book = fake_book(tmp_path, 45)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} rain." for i in range(5)),
+            },
+            {
+                "spine_index": 1,
+                "href": "chapter2.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} sword." for i in range(5)),
+            },
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=3,
+        min_words=1,
+        regions=True,
+        debug_text=True,
+        spine_extractor=fake_extractor,
+    )
+    data = json.loads(inspect_text_path(tmp_path / "data", 45).read_text(encoding="utf-8"))
+    candidates = data["boundary_candidates"]
+
+    assert candidates
+    assert any(candidate["selected"] for candidate in candidates)
+    assert any(candidate["rejected_reason"] for candidate in candidates)
 
 
 def test_region_ranges_cover_all_anchors_exactly_once_and_enforce_maximum():
@@ -267,3 +339,64 @@ def test_chapter_boundary_reason_appears_in_deterministic_fixture():
         or "chapter_start" in region["boundary_out"]["reasons"]
         for region in regions
     )
+
+
+def test_clean_timeline_removes_only_timeline():
+    tmp_path = scratch_path()
+    book = fake_book(tmp_path, 46)
+    data_dir = tmp_path / "data"
+    book_dir = data_dir / "books" / "46"
+    book_dir.mkdir(parents=True)
+    timeline_path(data_dir, 46).write_text("{}", encoding="utf-8")
+    inspect_text_path(data_dir, 46).write_text("{}", encoding="utf-8")
+
+    assert remove_timeline(data_dir, book["calibre_book_id"]) is True
+
+    assert not timeline_path(data_dir, 46).exists()
+    assert inspect_text_path(data_dir, 46).exists()
+
+
+def test_clean_regions_preserves_anchors_features_and_removes_only_regions():
+    tmp_path = scratch_path()
+    book = fake_book(tmp_path, 47)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} forest." for i in range(6)),
+            },
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=3,
+        min_words=1,
+        regions=True,
+        spine_extractor=fake_extractor,
+    )
+
+    assert remove_regions_from_timeline(tmp_path / "data", 47) is True
+    timeline = load_timeline(tmp_path / "data", 47)
+
+    assert "regions" not in timeline
+    assert timeline["builder"]["regions"] is False
+    assert timeline["anchors"]
+    assert timeline["features"]
+
+
+def test_clean_inspect_text_removes_only_sidecar():
+    tmp_path = scratch_path()
+    book = fake_book(tmp_path, 48)
+    data_dir = tmp_path / "data"
+    book_dir = data_dir / "books" / "48"
+    book_dir.mkdir(parents=True)
+    timeline_path(data_dir, 48).write_text("{}", encoding="utf-8")
+    inspect_text_path(data_dir, 48).write_text("{}", encoding="utf-8")
+
+    assert remove_inspect_text(data_dir, book["calibre_book_id"]) is True
+
+    assert timeline_path(data_dir, 48).exists()
+    assert not inspect_text_path(data_dir, 48).exists()

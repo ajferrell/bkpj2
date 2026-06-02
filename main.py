@@ -26,8 +26,12 @@ from src.calibre_native import (
 from src.anchors import (
     find_anchor_for_position,
     find_region_for_anchor,
+    inspect_text_path,
     load_timeline,
     prepare_book_timeline,
+    remove_inspect_text,
+    remove_regions_from_timeline,
+    remove_timeline,
     timeline_path,
 )
 from src.cfi_fixtures import (
@@ -93,6 +97,7 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         target_words=args.target_words,
         min_words=args.min_words,
         regions=args.regions,
+        debug_text=args.debug_text,
     )
     timeline = load_timeline(args.data_dir, book["calibre_book_id"])
     print(f"Prepared book: {book.get('title')}")
@@ -102,6 +107,30 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
     print(f"Anchors: {len(timeline.get('anchors', []))}")
     if args.regions:
         print(f"Regions: {len(timeline.get('regions', []))}")
+    if args.debug_text:
+        print(f"Inspect text: {inspect_text_path(args.data_dir, book['calibre_book_id'])}")
+    return 0
+
+
+def cmd_clean_book(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    requested = [args.timeline, args.regions, args.inspect_text]
+    if not any(requested):
+        raise ValueError("Choose at least one cleanup flag: --timeline, --regions, or --inspect-text")
+
+    print(f"Cleaned book: {book.get('title')}")
+    if args.timeline:
+        removed = remove_timeline(args.data_dir, book["calibre_book_id"])
+        status = "removed" if removed else "not found"
+        print(f"  timeline: {status}")
+    if args.regions:
+        changed = remove_regions_from_timeline(args.data_dir, book["calibre_book_id"])
+        status = "removed" if changed else "already absent"
+        print(f"  regions: {status}")
+    if args.inspect_text:
+        removed = remove_inspect_text(args.data_dir, book["calibre_book_id"])
+        status = "removed" if removed else "not found"
+        print(f"  inspect_text: {status}")
     return 0
 
 
@@ -434,7 +463,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-words", type=int, default=350)
     p.add_argument("--min-words", type=int, default=180)
     p.add_argument("--regions", action="store_true", help="Build deterministic region records")
+    p.add_argument("--debug-text", action="store_true", help="Write inspect_text.json with full debug text")
     p.set_defaults(func=cmd_prepare_book)
+
+    p = sub.add_parser("clean-book", help="Remove generated cache artifacts for one imported book")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--timeline", action="store_true", help="Remove timeline.json")
+    p.add_argument("--regions", action="store_true", help="Remove region records from timeline.json")
+    p.add_argument("--inspect-text", action="store_true", help="Remove inspect_text.json")
+    p.set_defaults(func=cmd_clean_book)
 
     p = sub.add_parser("inspect-book", help="Inspect an imported book")
     p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
