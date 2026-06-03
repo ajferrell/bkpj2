@@ -33,14 +33,23 @@ from src.anchors import (
     inspect_position_chain,
     inspect_text_path,
     load_timeline,
+    load_timeline_with_sidecars,
     prepare_book_timeline,
+    region_diagnostics_path,
     region_review_path,
     remove_inspect_text,
     remove_regions_from_timeline,
     remove_timeline,
+    source_units_path,
     timeline_drift_warnings,
     timeline_path,
     write_region_review_artifact,
+)
+from src.audio_planner import (
+    audio_asset_catalog_path,
+    build_audio_intents,
+    load_asset_catalog,
+    simulate_reading_trace,
 )
 from src.cfi_fixtures import (
     capture_live_fixture,
@@ -106,15 +115,17 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         min_words=args.min_words,
         regions=args.regions,
         atmosphere=args.atmosphere,
+        audio_intents=args.audio_intents,
+        asset_catalog_path=args.asset_catalog,
         debug_text=args.debug_text,
         region_profile=args.region_profile,
         region_review=load_region_review(args.data_dir, book["calibre_book_id"]) if args.use_region_review else None,
     )
-    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    timeline = load_timeline_with_sidecars(args.data_dir, book["calibre_book_id"])
     print(f"Prepared book: {book.get('title')}")
     print(f"Timeline: {path}")
     print(f"Spine items: {len(timeline.get('spine', []))}")
-    print(f"Source units: {len(timeline.get('source_units', []))}")
+    print(f"Source units sidecar: {source_units_path(args.data_dir, book['calibre_book_id'])}")
     print(f"Anchors: {len(timeline.get('anchors', []))}")
     if args.regions:
         print(f"Regions: {len(timeline.get('regions', []))}")
@@ -126,6 +137,10 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         print(f"Atmosphere labels: {len(atmosphere.get('region_labels', []))}")
         churn = atmosphere.get("diagnostics", {}).get("transition_churn", {})
         print(f"Atmosphere transitions: {churn.get('transition_count', 0)}")
+    if args.audio_intents:
+        intents = timeline.get("audio_intents", {})
+        print(f"Audio intents: {len(intents.get('intents', []))}")
+        print(f"Neutral fallbacks: {intents.get('diagnostics', {}).get('neutral_fallback_count', 0)}")
     if args.debug_text:
         print(f"Inspect text: {inspect_text_path(args.data_dir, book['calibre_book_id'])}")
     return 0
@@ -344,7 +359,7 @@ def cmd_cfi_fixtures(args: argparse.Namespace) -> int:
 
 def cmd_region_review(args: argparse.Namespace) -> int:
     book = find_book(args.query, args.data_dir)
-    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    timeline = load_timeline_with_sidecars(args.data_dir, book["calibre_book_id"])
     if args.review_command == "init":
         path = write_region_review_artifact(
             book,
@@ -382,6 +397,40 @@ def cmd_region_review(args: argparse.Namespace) -> int:
         return 1 if result["expected_missed"] or result["noisy_selected"] else 0
 
     raise ValueError(f"Unknown region-review command: {args.review_command}")
+
+
+def cmd_audio_plan(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    if not timeline.get("regions"):
+        raise ValueError("Timeline has no regions. Run prepare-book with --regions.")
+    catalog_path = args.asset_catalog or audio_asset_catalog_path(args.data_dir, book["calibre_book_id"])
+    catalog = load_asset_catalog(catalog_path)
+    planned = timeline.get("audio_intents") or build_audio_intents(timeline, catalog)
+    if args.plan_command == "inspect":
+        print(f"Audio intents: {len(planned.get('intents', []))}")
+        print(f"Neutral fallbacks: {planned.get('diagnostics', {}).get('neutral_fallback_count', 0)}")
+        for intent in planned.get("intents", [])[: args.limit]:
+            base = intent.get("base_bed", {})
+            print(
+                f"  #{intent['region_id']} {intent['intent_id']} "
+                f"effective={intent.get('effective_atmosphere')} "
+                f"base={base.get('matched_category')} asset={base.get('asset_id')} "
+                f"intensity={intent.get('intensity')}"
+            )
+        return 0
+    if args.plan_command == "simulate":
+        trace = load_trace(args.trace, planned.get("intents", []))
+        result = simulate_reading_trace(planned.get("intents", []), trace)
+        print(f"Trace polls: {result['poll_count']}")
+        print(f"Transitions: {result['transition_count']}")
+        for item in result["events"][: args.limit]:
+            print(
+                f"  t={item['time_seconds']} region={item.get('region_id')} "
+                f"{item['action']} reason={item['reason']} intent={item.get('intent_id')}"
+            )
+        return 0
+    raise ValueError(f"Unknown audio-plan command: {args.plan_command}")
 
 
 def cmd_annots_key(args: argparse.Namespace) -> int:
@@ -516,7 +565,7 @@ def _print_anchor_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -
     if not path.exists():
         print(f"  No timeline found. Run: python main.py prepare-book \"{book.get('title')}\"")
         return
-    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    timeline = load_timeline_with_sidecars(data_dir, book["calibre_book_id"])
     print(f"  Path: {path}")
     print(f"  Spine items: {len(timeline.get('spine', []))}")
     print(f"  Anchors: {len(timeline.get('anchors', []))}")
@@ -536,7 +585,7 @@ def _print_region_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -
     if not path.exists():
         print(f"  No timeline found. Run: python main.py prepare-book \"{book.get('title')}\" --regions")
         return
-    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    timeline = load_timeline_with_sidecars(data_dir, book["calibre_book_id"])
     anchors = timeline.get("anchors", [])
     regions = timeline.get("regions", [])
     if anchors and not regions:
@@ -644,6 +693,20 @@ def evaluate_atmosphere_review(review: dict[str, Any]) -> dict[str, int] | None:
     }
 
 
+def load_trace(path: str | None, intents: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    if path:
+        with open(path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        return data.get("polls", data if isinstance(data, list) else [])
+    trace = []
+    now = 0.0
+    for intent in intents[:5]:
+        trace.append({"time_seconds": now, "region_id": intent["region_id"]})
+        trace.append({"time_seconds": now + 1.0, "region_id": intent["region_id"]})
+        now += 60.0
+    return trace
+
+
 def _print_live_anchor(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
     path = timeline_path(data_dir, book["calibre_book_id"])
     print("\nActive anchor:")
@@ -719,6 +782,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--min-words", type=int, default=180)
     p.add_argument("--regions", action="store_true", help="Build deterministic region records")
     p.add_argument("--atmosphere", action="store_true", help="Attach deterministic atmosphere labels to regions")
+    p.add_argument("--audio-intents", action="store_true", help="Attach declarative audio scene intents")
+    p.add_argument("--asset-catalog", help="Path to an audio asset catalog JSON")
     p.add_argument(
         "--region-profile",
         choices=sorted(REGION_PROFILES),
@@ -783,6 +848,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
     p.add_argument("--overwrite", action="store_true", help="Replace an existing region_review.json")
     p.set_defaults(func=cmd_region_review)
+
+    p = sub.add_parser("audio-plan", help="Inspect or simulate declarative audio intents")
+    p.add_argument("plan_command", choices=["inspect", "simulate"])
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--asset-catalog", help="Path to an audio asset catalog JSON")
+    p.add_argument("--trace", help="JSON trace with region_id/time_seconds polls")
+    p.add_argument("--limit", type=int, default=10)
+    p.set_defaults(func=cmd_audio_plan)
 
     p = sub.add_parser("annots-key", help="Compute Calibre viewer annots filename for an EPUB path")
     p.add_argument("epub_path")

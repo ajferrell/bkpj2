@@ -4,7 +4,8 @@ This repo is being rebuilt around a Calibre-native reading-position spine.
 The current active implementation imports a Calibre library, maps EPUB paths to
 Calibre E-book Viewer annotation files, prepares source-aligned anchors and
 deterministic regions, attaches reviewable deterministic atmosphere labels, and
-inspects live EPUB CFI positions against that timeline.
+plans restrained declarative audio intents that can be inspected before any
+runtime playback exists.
 
 The previous generic EPUB/chunk/round-robin prototype has been moved to
 `old/prototype/`.
@@ -21,15 +22,15 @@ other than `data`.
 - `list-books`: list imported books, optionally filtering to EPUB-capable
   entries or a title/author/id query.
 - `prepare-book`: extract Calibre-compatible spine text and write a book
-  timeline with source units, anchors, optional deterministic regions, and
-  optional deterministic atmosphere labels.
+  timeline with anchors, optional deterministic regions, optional deterministic
+  atmosphere labels, and optional declarative audio intents.
 - `clean-book`: remove generated timeline, region, or debug sidecar artifacts
   for one imported book.
 
 ```powershell
 python main.py import-calibre "C:\Users\<you>\Calibre Library"
 python main.py list-books --epub-only
-python main.py prepare-book "Book Title" --regions --atmosphere --region-profile normal
+python main.py prepare-book "Book Title" --regions --atmosphere --audio-intents --region-profile normal
 python main.py clean-book "Book Title" --regions
 ```
 
@@ -41,6 +42,8 @@ python main.py clean-book "Book Title" --regions
   back to an imported book.
 - `watch-live`: poll the newest viewer position and optionally capture CFI
   fixtures while reading.
+- `audio-plan`: inspect planned declarative audio intents or simulate reading
+  traces against transition controls.
 
 ```powershell
 python main.py inspect-book "Book Title" --anchors --regions
@@ -48,6 +51,8 @@ python main.py inspect-book "Book Title" --atmosphere
 python main.py inspect-book "Book Title" --live --resolve-cfi --anchors --regions --chain
 python main.py inspect-live --resolve-cfi
 python main.py watch-live --resolve-cfi
+python main.py audio-plan inspect "Book Title"
+python main.py audio-plan simulate "Book Title"
 ```
 
 ### Fixtures and Review
@@ -80,25 +85,31 @@ Calibre library EPUB path
 -> anchor
 -> region
 -> boundary reasons
+-> atmosphere summary
+-> audio intent
 ```
 
-Audio scores, playback, and the adaptive mixer are intentionally still future
+Actual sound output and the adaptive mixer are intentionally still future
 stages.
 
-## Region and Atmosphere Review Workflow
+## Region, Atmosphere, and Intent Review Workflow
 
 The current region system divides the prepared anchor timeline into larger
 regions using chapter starts, scene separators, pacing shifts, keyword shifts,
 and length limits. The atmosphere scorer then applies local cue lexicons to
 those regions and records conservative labels, abstentions, evidence anchors,
-and transition churn.
+and transition churn. The audio planner maps each region to a declarative
+`AudioSceneIntent` with a base category, optional layers, restrained intensity,
+fade settings, minimum dwell, and neutral fallback behavior.
 
 Typical flow:
 
 ```powershell
 python main.py import-calibre "C:\Users\<you>\Calibre Library"
-python main.py prepare-book "The Mirror's Truth" --regions --atmosphere
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-intents
 python main.py inspect-book "The Mirror's Truth" --anchors --regions --atmosphere --region-limit 20
+python main.py audio-plan inspect "The Mirror's Truth"
+python main.py audio-plan simulate "The Mirror's Truth"
 python main.py region-review init "The Mirror's Truth"
 ```
 
@@ -117,6 +128,9 @@ Interpret the inspect output in layers:
 - `Atmosphere`: deterministic `setting`, `environment`, `energy`, and `affect`
   labels, confidence bands, evidence anchors, abstentions, comparator status,
   and collapsed transition churn.
+- `Audio intents`: planner-facing ambience instructions. Unknown labels,
+  missing asset catalogs, or unmatched categories resolve to neutral fallback
+  intents instead of hard failures.
 
 After `region-review init`, open
 `data/books/<calibre_book_id>/region_review.json`. Mark only boundaries you
@@ -130,9 +144,10 @@ care about:
 Then rebuild and check:
 
 ```powershell
-python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --use-region-review
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-intents --use-region-review
 python main.py region-review check "The Mirror's Truth"
 python main.py inspect-book "The Mirror's Truth" --regions --atmosphere --region-limit 20
+python main.py audio-plan inspect "The Mirror's Truth"
 ```
 
 Use profiles to compare how aggressively the deterministic builder splits:
@@ -144,3 +159,18 @@ python main.py prepare-book "The Mirror's Truth" --regions --region-profile sens
 
 `conservative` makes fewer, longer regions. `sensitive` makes more, shorter
 regions. `normal` is the default.
+
+## Planner Artifacts
+
+New prepared timelines are compact planner-facing `timeline.json` files. Verbose
+review data is written to sidecars:
+
+- `source_units.json`: paragraph/source-unit offsets and previews.
+- `region_diagnostics.json`: boundary candidates, selected boundaries, rejected
+  reasons, and review summaries.
+- `inspect_text.json`: optional full-text debug sidecar, written only with
+  `prepare-book --debug-text`.
+
+The planner can use `data/books/<calibre_book_id>/audio_assets.json` or an
+explicit `--asset-catalog` path. If no usable local catalog is present, it uses
+a built-in neutral silent fallback so planner inspection still works.

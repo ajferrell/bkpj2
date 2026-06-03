@@ -17,17 +17,21 @@ from src.anchors import (
     inspect_position_chain,
     inspect_text_path,
     load_timeline,
+    load_timeline_with_sidecars,
     paragraph_spans,
     prepare_book_timeline,
+    region_diagnostics_path,
     region_review_path,
     remove_inspect_text,
     remove_regions_from_timeline,
     remove_timeline,
     resolve_region_config,
+    source_units_path,
     timeline_drift_warnings,
     timeline_path,
     write_region_review_artifact,
 )
+from src.audio_planner import build_audio_intents, simulate_reading_trace
 from src.atmosphere import build_atmosphere_extension, transition_churn
 from src.calibre_native import LiveAnnotation
 
@@ -143,15 +147,17 @@ def test_prepare_book_timeline_with_fake_extractor(tmp_path):
     timeline = load_timeline(tmp_path / "data", 42)
 
     assert path.exists()
-    assert timeline["schema_version"] == 4
+    assert timeline["schema_version"] == 5
     assert timeline["book"]["title"] == "Book"
-    assert len(timeline["source_units"]) == 2
+    assert "source_units" not in timeline
     assert len(timeline["anchors"]) == 1
     assert timeline["anchors"][0]["source_unit_start"] == 0
     assert timeline["anchors"][0]["source_unit_end"] == 2
     assert timeline["anchors"][0]["text"]["word_count"] == 6
     assert "plain" not in timeline["anchors"][0]["text"]
-    assert "_text" not in timeline["source_units"][0]
+    source_sidecar = json.loads(source_units_path(tmp_path / "data", 42).read_text(encoding="utf-8"))
+    assert len(source_sidecar["source_units"]) == 2
+    assert "_text" not in source_sidecar["source_units"][0]
     assert not inspect_text_path(tmp_path / "data", 42).exists()
 
 
@@ -180,7 +186,7 @@ def test_prepare_book_timeline_debug_text_writes_sidecar(tmp_path):
 
     assert sidecar.exists()
     assert "plain" not in timeline["anchors"][0]["text"]
-    assert "_text" not in timeline["source_units"][0]
+    assert "source_units" not in timeline
     data = json.loads(sidecar.read_text(encoding="utf-8"))
     assert data["anchors"]["0"]["plain"] == "Alpha beta gamma.\n\nDelta epsilon zeta."
     assert data["source_units"]["0"]["text"] == "Alpha beta gamma."
@@ -215,6 +221,8 @@ def test_prepare_book_timeline_can_write_regions(tmp_path):
 
     assert timeline["regions"]
     assert timeline["regions"][0]["boundary_in"]["reasons"] == ["book_start"]
+    assert "region_diagnostics" not in timeline
+    assert region_diagnostics_path(tmp_path / "data", 43).exists()
 
 
 def test_prepare_book_timeline_can_write_atmosphere_without_full_text(tmp_path):
@@ -256,7 +264,7 @@ def test_prepare_book_timeline_can_write_atmosphere_without_full_text(tmp_path):
     timeline = load_timeline(tmp_path / "data", 51)
     labels = timeline["atmosphere"]["region_labels"]
 
-    assert timeline["schema_version"] == 4
+    assert timeline["schema_version"] == 5
     assert timeline["builder"]["atmosphere"] is True
     assert len(labels) == len(timeline["regions"])
     assert timeline["atmosphere"]["method"]["configuration_hash"]
@@ -378,7 +386,7 @@ def test_prepare_book_timeline_records_region_profile_and_diagnostics(tmp_path):
         region_profile="sensitive",
         spine_extractor=fake_extractor,
     )
-    timeline = load_timeline(tmp_path / "data", 49)
+    timeline = load_timeline_with_sidecars(tmp_path / "data", 49)
     diagnostics = timeline["region_diagnostics"]
 
     assert timeline["builder"]["region_config"] == REGION_PROFILES["sensitive"]
@@ -429,7 +437,7 @@ def test_region_review_marks_suppress_noisy_and_force_expected_boundaries():
 def test_region_review_artifact_marks_expected_boundaries(tmp_path):
     book = fake_book(tmp_path, 50)
     timeline = {
-        "schema_version": 4,
+        "schema_version": 5,
         "created_at": "2026-06-03T12:00:00",
         "book": {"epub_path": book["preferred_epub_path"], "epub_hash": "hash", "annots_key": "abc.json"},
         "anchors": [{"anchor_id": 0}, {"anchor_id": 1}],
@@ -454,7 +462,7 @@ def test_region_review_artifact_marks_expected_boundaries(tmp_path):
 def test_region_review_artifact_includes_atmosphere_review_fields(tmp_path):
     book = fake_book(tmp_path, 53)
     timeline = {
-        "schema_version": 4,
+        "schema_version": 5,
         "created_at": "2026-06-03T12:00:00",
         "book": {"epub_path": book["preferred_epub_path"], "epub_hash": "hash", "annots_key": "abc.json"},
         "anchors": [{"anchor_id": 0}],
@@ -581,7 +589,7 @@ def test_inspect_position_chain_reports_book_to_region_chain():
         "spine_text_len": len(spine[0]["text"]),
     }
     timeline = {
-        "schema_version": 3,
+        "schema_version": 4,
         "book": {"epub_path": "book.epub", "annots_key": "abc.json"},
         "spine": spine,
         "source_units": source_units,
@@ -693,6 +701,7 @@ def test_clean_regions_preserves_anchors_features_and_removes_only_regions(tmp_p
     timeline = load_timeline(tmp_path / "data", 47)
 
     assert "regions" not in timeline
+    assert "audio_intents" not in timeline
     assert timeline["builder"]["regions"] is False
     assert timeline["anchors"]
     assert timeline["features"]
@@ -717,3 +726,72 @@ def test_clean_inspect_text_removes_only_sidecar(tmp_path, monkeypatch):
 
     assert timeline_path(data_dir, 48).exists()
     assert unlinked == [target]
+
+
+def test_prepare_book_timeline_writes_audio_intents_without_verbose_diagnostics(tmp_path):
+    book = fake_book(tmp_path, 54)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join([
+                    "Rain and thunder filled the forest road.",
+                    "The storm wind crossed the dark field.",
+                    "The sword fight spilled blood across the hall.",
+                    "They ran from the attack and shouted in fear.",
+                ]),
+            }
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=8,
+        min_words=1,
+        regions=True,
+        atmosphere=True,
+        audio_intents=True,
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 54)
+
+    assert timeline["audio_intents"]["intents"]
+    assert "source_units" not in timeline
+    assert "region_diagnostics" not in timeline
+    assert source_units_path(tmp_path / "data", 54).exists()
+    assert region_diagnostics_path(tmp_path / "data", 54).exists()
+
+
+def test_audio_intents_use_neutral_fallback_for_unknown_or_unmatched_assets():
+    timeline = {
+        "regions": [{"region_id": 0, "anchor_start": 0, "anchor_end": 1, "stats": {"anchor_count": 1}}],
+        "atmosphere": {"region_labels": [{"region_id": 0, "effective_atmosphere": "unknown", "abstained": True}]},
+    }
+    planned = build_audio_intents(timeline, {"schema_version": 1, "assets": []})
+    intent = planned["intents"][0]
+
+    assert intent["effective_atmosphere"] == "unknown"
+    assert intent["base_bed"]["matched_category"] == "neutral"
+    assert intent["suppression_reason"] == "neutral_fallback"
+
+
+def test_audio_trace_simulation_suppresses_repeated_and_short_jumps():
+    intents = [
+        {"intent_id": "region-0", "region_id": 0, "effective_atmosphere": "unknown"},
+        {"intent_id": "region-1", "region_id": 1, "effective_atmosphere": "environment:weather"},
+    ]
+    trace = [
+        {"time_seconds": 0, "region_id": 0},
+        {"time_seconds": 1, "region_id": 0},
+        {"time_seconds": 2, "region_id": 1},
+        {"time_seconds": 4, "region_id": 1},
+        {"time_seconds": 70, "region_id": 1},
+    ]
+
+    result = simulate_reading_trace(intents, trace)
+
+    assert result["transition_count"] == 2
+    assert result["events"][1]["reason"] == "same_region"
+    assert any(event["reason"] == "jump_suppression" for event in result["events"])

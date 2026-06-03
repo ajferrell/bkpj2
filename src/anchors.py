@@ -10,11 +10,14 @@ from pathlib import Path
 from typing import Any, Optional
 
 from .atmosphere import build_atmosphere_extension
+from .audio_planner import build_audio_intents, load_asset_catalog
 from .cfi_fixtures import file_sha256
 
 
-TIMELINE_SCHEMA_VERSION = 4
+TIMELINE_SCHEMA_VERSION = 5
 REGION_REVIEW_SCHEMA_VERSION = 1
+SOURCE_UNITS_SCHEMA_VERSION = 1
+REGION_DIAGNOSTICS_SCHEMA_VERSION = 1
 
 DEFAULT_REGION_CONFIG = {
     "min_anchors": 3,
@@ -88,6 +91,14 @@ def inspect_text_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return timeline_dir(data_dir, calibre_book_id) / "inspect_text.json"
 
 
+def source_units_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return timeline_dir(data_dir, calibre_book_id) / "source_units.json"
+
+
+def region_diagnostics_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return timeline_dir(data_dir, calibre_book_id) / "region_diagnostics.json"
+
+
 def region_review_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return timeline_dir(data_dir, calibre_book_id) / "region_review.json"
 
@@ -99,6 +110,8 @@ def prepare_book_timeline(
     min_words: int = 180,
     regions: bool = False,
     atmosphere: bool = False,
+    audio_intents: bool = False,
+    asset_catalog_path: str | Path | None = None,
     debug_text: bool = False,
     region_config: Optional[dict[str, Any]] = None,
     region_profile: str = "normal",
@@ -124,6 +137,7 @@ def prepare_book_timeline(
             "min_words": min_words,
             "regions": bool(regions),
             "atmosphere": bool(atmosphere),
+            "audio_intents": bool(audio_intents),
             "region_config": config,
         },
         "book": {
@@ -143,7 +157,6 @@ def prepare_book_timeline(
             }
             for item in spine
         ],
-        "source_units": [serialize_source_unit(unit) for unit in source_units],
         "anchors": anchors,
         "features": features,
     }
@@ -155,7 +168,8 @@ def prepare_book_timeline(
             apply_region_review_marks(boundary_candidates, region_review)
         result = build_regions(anchors, boundary_candidates, config)
         timeline["regions"] = result["regions"]
-        timeline["region_diagnostics"] = {
+        region_diagnostics = {
+            "schema_version": REGION_DIAGNOSTICS_SCHEMA_VERSION,
             "profile": region_profile,
             "config": config,
             "boundary_candidates": result["boundary_candidates"],
@@ -166,21 +180,36 @@ def prepare_book_timeline(
             ],
         }
         if region_review:
-            timeline["region_diagnostics"]["review"] = evaluate_region_review(
+            region_diagnostics["review"] = evaluate_region_review(
                 result["boundary_candidates"],
                 region_review,
             )
+        timeline["region_diagnostics"] = region_diagnostics
     elif atmosphere:
         raise ValueError("--atmosphere requires --regions")
 
     if atmosphere:
         timeline["atmosphere"] = build_atmosphere_extension(timeline, anchors)
+    if audio_intents:
+        if not regions:
+            raise ValueError("--audio-intents requires --regions")
+        catalog = load_asset_catalog(asset_catalog_path)
+        timeline["audio_intents"] = build_audio_intents(timeline, catalog)
 
     out_dir = timeline_dir(data_dir, book["calibre_book_id"])
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / "timeline.json"
     with open(path, "w", encoding="utf-8") as f:
         json.dump(slim_timeline(timeline), f, indent=2, ensure_ascii=False)
+    with open(source_units_path(data_dir, book["calibre_book_id"]), "w", encoding="utf-8") as f:
+        json.dump(source_units_sidecar(timeline, source_units), f, indent=2, ensure_ascii=False)
+    if regions:
+        with open(region_diagnostics_path(data_dir, book["calibre_book_id"]), "w", encoding="utf-8") as f:
+            json.dump(timeline["region_diagnostics"], f, indent=2, ensure_ascii=False)
+    else:
+        diagnostics_path = region_diagnostics_path(data_dir, book["calibre_book_id"])
+        if diagnostics_path.exists():
+            remove_json_sidecar(diagnostics_path, REGION_DIAGNOSTICS_SCHEMA_VERSION)
     sidecar_path = inspect_text_path(data_dir, book["calibre_book_id"])
     if debug_text:
         with open(sidecar_path, "w", encoding="utf-8") as f:
@@ -199,6 +228,21 @@ def load_timeline(data_dir: str | Path, calibre_book_id: int | str) -> dict[str,
     path = timeline_path(data_dir, calibre_book_id)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def load_timeline_with_sidecars(data_dir: str | Path, calibre_book_id: int | str) -> dict[str, Any]:
+    timeline = load_timeline(data_dir, calibre_book_id)
+    source_path = source_units_path(data_dir, calibre_book_id)
+    if "source_units" not in timeline and source_path.exists():
+        with open(source_path, "r", encoding="utf-8") as f:
+            timeline["source_units"] = json.load(f).get("source_units", [])
+    diagnostics_path = region_diagnostics_path(data_dir, calibre_book_id)
+    if "region_diagnostics" not in timeline and diagnostics_path.exists():
+        with open(diagnostics_path, "r", encoding="utf-8") as f:
+            diagnostics = json.load(f)
+        if not diagnostics.get("removed"):
+            timeline["region_diagnostics"] = diagnostics
+    return timeline
 
 
 def resolve_region_config(profile: str = "normal", overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
@@ -491,6 +535,9 @@ def remove_regions_from_timeline(data_dir: str | Path, calibre_book_id: int | st
     if "atmosphere" in timeline:
         timeline.pop("atmosphere")
         changed = True
+    if "audio_intents" in timeline:
+        timeline.pop("audio_intents")
+        changed = True
     builder = timeline.setdefault("builder", {})
     if builder.get("regions") is not False:
         builder["regions"] = False
@@ -498,10 +545,25 @@ def remove_regions_from_timeline(data_dir: str | Path, calibre_book_id: int | st
     if builder.get("atmosphere") is not False:
         builder["atmosphere"] = False
         changed = True
+    if builder.get("audio_intents") is not False:
+        builder["audio_intents"] = False
+        changed = True
     if changed:
         with open(path, "w", encoding="utf-8") as f:
             json.dump(timeline, f, indent=2, ensure_ascii=False)
+    diagnostics_path = region_diagnostics_path(data_dir, calibre_book_id)
+    if diagnostics_path.exists():
+        remove_json_sidecar(diagnostics_path, REGION_DIAGNOSTICS_SCHEMA_VERSION)
+        changed = True
     return changed
+
+
+def remove_json_sidecar(path: Path, schema_version: int) -> None:
+    try:
+        path.unlink()
+    except PermissionError:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"schema_version": schema_version, "removed": True}, f, indent=2)
 
 
 def extract_spine_texts_with_calibre(epub_path: str | Path) -> list[dict[str, Any]]:
@@ -566,15 +628,25 @@ def serialize_source_unit(unit: dict[str, Any]) -> dict[str, Any]:
 
 def slim_timeline(timeline: dict[str, Any]) -> dict[str, Any]:
     slim = dict(timeline)
-    slim["source_units"] = [
-        serialize_source_unit(unit)
-        for unit in timeline.get("source_units", [])
-    ]
+    slim.pop("source_units", None)
+    slim.pop("region_diagnostics", None)
     slim["anchors"] = [
         slim_anchor(anchor)
         for anchor in timeline.get("anchors", [])
     ]
     return slim
+
+
+def source_units_sidecar(timeline: dict[str, Any], source_units: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        "schema_version": SOURCE_UNITS_SCHEMA_VERSION,
+        "timeline": {
+            "schema_version": timeline.get("schema_version"),
+            "created_at": timeline.get("created_at"),
+            "calibre_book_id": timeline.get("book", {}).get("calibre_book_id"),
+        },
+        "source_units": [serialize_source_unit(unit) for unit in source_units],
+    }
 
 
 def slim_anchor(anchor: dict[str, Any]) -> dict[str, Any]:
