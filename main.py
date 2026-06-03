@@ -26,17 +26,21 @@ from src.calibre_native import (
     read_live_annotation_for_book,
 )
 from src.anchors import (
+    REGION_PROFILES,
     find_anchor_for_position,
     find_region_for_anchor,
+    load_region_review,
     inspect_position_chain,
     inspect_text_path,
     load_timeline,
     prepare_book_timeline,
+    region_review_path,
     remove_inspect_text,
     remove_regions_from_timeline,
     remove_timeline,
     timeline_drift_warnings,
     timeline_path,
+    write_region_review_artifact,
 )
 from src.cfi_fixtures import (
     capture_live_fixture,
@@ -102,6 +106,8 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         min_words=args.min_words,
         regions=args.regions,
         debug_text=args.debug_text,
+        region_profile=args.region_profile,
+        region_review=load_region_review(args.data_dir, book["calibre_book_id"]) if args.use_region_review else None,
     )
     timeline = load_timeline(args.data_dir, book["calibre_book_id"])
     print(f"Prepared book: {book.get('title')}")
@@ -111,6 +117,9 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
     print(f"Anchors: {len(timeline.get('anchors', []))}")
     if args.regions:
         print(f"Regions: {len(timeline.get('regions', []))}")
+        print(f"Region profile: {timeline.get('region_diagnostics', {}).get('profile', args.region_profile)}")
+        if args.use_region_review:
+            print(f"Region review: {region_review_path(args.data_dir, book['calibre_book_id'])}")
     if args.debug_text:
         print(f"Inspect text: {inspect_text_path(args.data_dir, book['calibre_book_id'])}")
     return 0
@@ -324,6 +333,40 @@ def cmd_cfi_fixtures(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown cfi-fixtures command: {args.fixture_command}")
 
 
+def cmd_region_review(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    if args.review_command == "init":
+        path = write_region_review_artifact(
+            book,
+            timeline,
+            data_dir=args.data_dir,
+            overwrite=args.overwrite,
+        )
+        print(f"Region review: {path}")
+        print(f"Boundary candidates: {len(timeline.get('region_diagnostics', {}).get('boundary_candidates', []))}")
+        return 0
+
+    if args.review_command == "check":
+        review = load_region_review(args.data_dir, book["calibre_book_id"])
+        diagnostics = timeline.get("region_diagnostics", {})
+        result = diagnostics.get("review")
+        if result is None:
+            from src.anchors import evaluate_region_review
+
+            result = evaluate_region_review(diagnostics.get("boundary_candidates", []), review)
+        print(f"Region review: {region_review_path(args.data_dir, book['calibre_book_id'])}")
+        print(f"  expected: {result['expected_count']}")
+        print(f"  expected selected: {len(result['expected_selected'])}")
+        print(f"  expected missed: {len(result['expected_missed'])}")
+        print(f"  noisy false positives: {result['noisy_false_positive_count']}")
+        print(f"  noisy selected: {len(result['noisy_selected'])}")
+        print(f"  noisy rejected: {len(result['noisy_rejected'])}")
+        return 1 if result["expected_missed"] or result["noisy_selected"] else 0
+
+    raise ValueError(f"Unknown region-review command: {args.review_command}")
+
+
 def cmd_annots_key(args: argparse.Namespace) -> int:
     print(compute_annots_key(args.epub_path))
     return 0
@@ -483,6 +526,17 @@ def _print_region_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -
         print("  Warning: timeline has anchors but no regions. Run prepare-book with --regions.")
         return
     print(f"  Count: {len(regions)}")
+    diagnostics = timeline.get("region_diagnostics", {})
+    if diagnostics:
+        print(f"  Profile: {diagnostics.get('profile')}")
+        config = diagnostics.get("config", {})
+        print(
+            "  Config: "
+            f"min={config.get('min_anchors')} "
+            f"target={config.get('target_anchors')} "
+            f"max={config.get('max_anchors')} "
+            f"threshold={config.get('boundary_threshold')}"
+        )
     for region in regions[:limit]:
         boundary_in = ", ".join(region.get("boundary_in", {}).get("reasons", [])) or "none"
         boundary_out = ", ".join(region.get("boundary_out", {}).get("reasons", [])) or "none"
@@ -495,6 +549,18 @@ def _print_region_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -
         print(f"     in: {boundary_in}")
         print(f"     out: {boundary_out}")
         print(f"     preview: {region.get('preview', '')}")
+    candidates = diagnostics.get("boundary_candidates", [])
+    if candidates:
+        print("  Boundary candidates:")
+        for candidate in candidates[:limit]:
+            reasons = ", ".join(candidate.get("reasons", [])) or "none"
+            status = "selected" if candidate.get("selected") else f"rejected:{candidate.get('rejected_reason')}"
+            print(
+                f"     edge={candidate.get('anchor_boundary')} "
+                f"source_unit={candidate.get('source_unit_boundary')} "
+                f"score={candidate.get('score')} {status} "
+                f"reasons={reasons}"
+            )
 
 
 def _print_live_anchor(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
@@ -571,6 +637,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-words", type=int, default=350)
     p.add_argument("--min-words", type=int, default=180)
     p.add_argument("--regions", action="store_true", help="Build deterministic region records")
+    p.add_argument(
+        "--region-profile",
+        choices=sorted(REGION_PROFILES),
+        default="normal",
+        help="Boundary sensitivity profile for --regions",
+    )
+    p.add_argument(
+        "--use-region-review",
+        action="store_true",
+        help="Apply data/books/<id>/region_review.json marks while building regions",
+    )
     p.add_argument("--debug-text", action="store_true", help="Write inspect_text.json with full debug text")
     p.set_defaults(func=cmd_prepare_book)
 
@@ -618,6 +695,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchors", action="store_true", help="Also require fixtures to map to prepared anchors")
     p.set_defaults(func=cmd_cfi_fixtures)
 
+    p = sub.add_parser("region-review", help="Create or check manual region review artifacts")
+    p.add_argument("review_command", choices=["init", "check"])
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--overwrite", action="store_true", help="Replace an existing region_review.json")
+    p.set_defaults(func=cmd_region_review)
+
     p = sub.add_parser("annots-key", help="Compute Calibre viewer annots filename for an EPUB path")
     p.add_argument("epub_path")
     p.set_defaults(func=cmd_annots_key)
@@ -630,7 +713,7 @@ def main() -> int:
     args = parser.parse_args()
     try:
         return args.func(args)
-    except (FileNotFoundError, LookupError, ValueError) as exc:
+    except (FileExistsError, FileNotFoundError, LookupError, ValueError) as exc:
         print(f"Error: {exc}", file=sys.stderr)
         return 1
 

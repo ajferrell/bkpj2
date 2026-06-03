@@ -4,8 +4,12 @@ from pathlib import Path
 from src.anchors import (
     BoundaryProvider,
     DEFAULT_REGION_CONFIG,
+    REGION_PROFILES,
+    apply_region_review_marks,
+    build_region_review_artifact,
     build_regions,
     build_anchors_from_spine,
+    evaluate_region_review,
     extract_anchor_features,
     extract_source_units,
     find_anchor_for_position,
@@ -15,11 +19,14 @@ from src.anchors import (
     load_timeline,
     paragraph_spans,
     prepare_book_timeline,
+    region_review_path,
     remove_inspect_text,
     remove_regions_from_timeline,
     remove_timeline,
+    resolve_region_config,
     timeline_drift_warnings,
     timeline_path,
+    write_region_review_artifact,
 )
 from src.calibre_native import LiveAnnotation
 
@@ -241,6 +248,105 @@ def test_prepare_book_timeline_debug_text_includes_boundary_candidates(tmp_path)
     assert candidates
     assert any(candidate["selected"] for candidate in candidates)
     assert any(candidate["rejected_reason"] for candidate in candidates)
+
+
+def test_prepare_book_timeline_records_region_profile_and_diagnostics(tmp_path):
+    book = fake_book(tmp_path, 49)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} rain." for i in range(8)),
+            },
+            {
+                "spine_index": 1,
+                "href": "chapter2.xhtml",
+                "text": "\n\n".join(f"Paragraph {i} sword." for i in range(8)),
+            },
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=3,
+        min_words=1,
+        regions=True,
+        region_profile="sensitive",
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 49)
+    diagnostics = timeline["region_diagnostics"]
+
+    assert timeline["builder"]["region_config"] == REGION_PROFILES["sensitive"]
+    assert diagnostics["profile"] == "sensitive"
+    assert diagnostics["boundary_candidates"]
+    assert all("anchor_boundary" in candidate for candidate in diagnostics["boundary_candidates"])
+    assert all(
+        "anchor_boundary" in boundary
+        for boundary in diagnostics["selected_boundaries"]
+    )
+
+
+def test_region_profiles_change_boundary_sensitivity():
+    sensitive = resolve_region_config("sensitive")
+    conservative = resolve_region_config("conservative")
+
+    assert sensitive["boundary_threshold"] < conservative["boundary_threshold"]
+    assert sensitive["max_anchors"] < conservative["max_anchors"]
+
+
+def test_region_review_marks_suppress_noisy_and_force_expected_boundaries():
+    anchors = [{"anchor_id": i, "source_unit_start": i, "source_unit_end": i + 1, "text": {"word_count": 1, "preview": f"a{i}"}} for i in range(6)]
+    candidates = [
+        {"anchor_boundary": 2, "source_unit_boundary": 2, "score": 0.8, "reasons": ["keyword_shift"], "selected": False, "rejected_reason": None, "snap": "exact"},
+        {"anchor_boundary": 4, "source_unit_boundary": 4, "score": 0.2, "reasons": ["dialogue_shift"], "selected": False, "rejected_reason": None, "snap": "exact"},
+    ]
+    review = {
+        "expected_boundaries": [
+            {"anchor_boundary": 2, "noisy_false_positive": True, "review_expected": None},
+            {"anchor_boundary": 4, "noisy_false_positive": False, "review_expected": True},
+        ]
+    }
+
+    apply_region_review_marks(candidates, review)
+    result = build_regions(
+        anchors,
+        candidates,
+        {"min_anchors": 1, "target_anchors": 3, "max_anchors": 10, "boundary_threshold": 0.65},
+    )
+    evaluation = evaluate_region_review(result["boundary_candidates"], review)
+
+    assert candidates[0]["rejected_reason"] == "manual_noisy_false_positive"
+    assert candidates[1]["selected"] is True
+    assert evaluation["expected_missed"] == []
+    assert evaluation["noisy_selected"] == []
+
+
+def test_region_review_artifact_marks_expected_boundaries(tmp_path):
+    book = fake_book(tmp_path, 50)
+    timeline = {
+        "schema_version": 3,
+        "created_at": "2026-06-03T12:00:00",
+        "book": {"epub_path": book["preferred_epub_path"], "epub_hash": "hash", "annots_key": "abc.json"},
+        "anchors": [{"anchor_id": 0}, {"anchor_id": 1}],
+        "regions": [{"region_id": 0, "anchor_start": 0, "anchor_end": 2, "boundary_in": {}, "boundary_out": {}, "preview": "Alpha"}],
+        "region_diagnostics": {
+            "profile": "normal",
+            "boundary_candidates": [
+                {"anchor_boundary": 1, "source_unit_boundary": 2, "score": 0.7, "reasons": ["chapter_start"], "selected": True}
+            ],
+        },
+    }
+
+    artifact = build_region_review_artifact(book, timeline)
+    path = write_region_review_artifact(book, timeline, data_dir=tmp_path / "data")
+
+    assert artifact["schema_version"] == 1
+    assert artifact["expected_boundaries"][0]["review_expected"] is None
+    assert region_review_path(tmp_path / "data", 50) == path
+    assert json.loads(path.read_text(encoding="utf-8"))["regions"][0]["preview"] == "Alpha"
 
 
 def test_region_ranges_cover_all_anchors_exactly_once_and_enforce_maximum():

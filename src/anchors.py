@@ -13,12 +13,29 @@ from .cfi_fixtures import file_sha256
 
 
 TIMELINE_SCHEMA_VERSION = 3
+REGION_REVIEW_SCHEMA_VERSION = 1
 
 DEFAULT_REGION_CONFIG = {
     "min_anchors": 3,
     "target_anchors": 8,
     "max_anchors": 18,
     "boundary_threshold": 0.65,
+}
+
+REGION_PROFILES = {
+    "conservative": {
+        "min_anchors": 5,
+        "target_anchors": 10,
+        "max_anchors": 24,
+        "boundary_threshold": 0.85,
+    },
+    "normal": DEFAULT_REGION_CONFIG,
+    "sensitive": {
+        "min_anchors": 2,
+        "target_anchors": 5,
+        "max_anchors": 12,
+        "boundary_threshold": 0.45,
+    },
 }
 
 KEYWORD_GROUPS = {
@@ -70,6 +87,10 @@ def inspect_text_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return timeline_dir(data_dir, calibre_book_id) / "inspect_text.json"
 
 
+def region_review_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return timeline_dir(data_dir, calibre_book_id) / "region_review.json"
+
+
 def prepare_book_timeline(
     book: dict[str, Any],
     data_dir: str | Path = "data",
@@ -78,6 +99,8 @@ def prepare_book_timeline(
     regions: bool = False,
     debug_text: bool = False,
     region_config: Optional[dict[str, Any]] = None,
+    region_profile: str = "normal",
+    region_review: Optional[dict[str, Any]] = None,
     spine_extractor= None,
 ) -> Path:
     epub_path = book.get("preferred_epub_path")
@@ -89,7 +112,7 @@ def prepare_book_timeline(
     source_units = extract_source_units(spine)
     anchors = build_anchors(source_units, target_words=target_words, min_words=min_words)
     features = extract_anchor_features(anchors)
-    config = {**DEFAULT_REGION_CONFIG, **(region_config or {})}
+    config = resolve_region_config(region_profile, region_config)
     timeline = {
         "schema_version": TIMELINE_SCHEMA_VERSION,
         "created_at": datetime.now().isoformat(timespec="seconds"),
@@ -125,8 +148,25 @@ def prepare_book_timeline(
     if regions:
         provider = BoundaryProvider()
         boundary_candidates = provider.score_boundaries(source_units, anchors, features, config)
+        if region_review:
+            apply_region_review_marks(boundary_candidates, region_review)
         result = build_regions(anchors, boundary_candidates, config)
         timeline["regions"] = result["regions"]
+        timeline["region_diagnostics"] = {
+            "profile": region_profile,
+            "config": config,
+            "boundary_candidates": result["boundary_candidates"],
+            "selected_boundaries": [
+                boundary_summary(candidate)
+                for candidate in result["boundary_candidates"]
+                if candidate.get("selected")
+            ],
+        }
+        if region_review:
+            timeline["region_diagnostics"]["review"] = evaluate_region_review(
+                result["boundary_candidates"],
+                region_review,
+            )
 
     out_dir = timeline_dir(data_dir, book["calibre_book_id"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -151,6 +191,140 @@ def load_timeline(data_dir: str | Path, calibre_book_id: int | str) -> dict[str,
     path = timeline_path(data_dir, calibre_book_id)
     with open(path, "r", encoding="utf-8") as f:
         return json.load(f)
+
+
+def resolve_region_config(profile: str = "normal", overrides: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    if profile not in REGION_PROFILES:
+        choices = ", ".join(sorted(REGION_PROFILES))
+        raise ValueError(f"Unknown region profile {profile!r}; choose one of: {choices}")
+    return {**REGION_PROFILES[profile], **(overrides or {})}
+
+
+def load_region_review(data_dir: str | Path, calibre_book_id: int | str) -> dict[str, Any]:
+    path = region_review_path(data_dir, calibre_book_id)
+    with open(path, "r", encoding="utf-8") as f:
+        return json.load(f)
+
+
+def write_region_review_artifact(
+    book: dict[str, Any],
+    timeline: dict[str, Any],
+    data_dir: str | Path = "data",
+    overwrite: bool = False,
+) -> Path:
+    path = region_review_path(data_dir, book["calibre_book_id"])
+    if path.exists() and not overwrite:
+        raise FileExistsError(f"Region review already exists: {path}")
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(build_region_review_artifact(book, timeline), f, indent=2, ensure_ascii=False)
+    return path
+
+
+def build_region_review_artifact(book: dict[str, Any], timeline: dict[str, Any]) -> dict[str, Any]:
+    diagnostics = timeline.get("region_diagnostics", {})
+    return {
+        "schema_version": REGION_REVIEW_SCHEMA_VERSION,
+        "created_at": datetime.now().isoformat(timespec="seconds"),
+        "book": {
+            "calibre_book_id": book.get("calibre_book_id"),
+            "calibre_uuid": book.get("calibre_uuid"),
+            "title": book.get("title"),
+            "epub_path": book.get("preferred_epub_path") or timeline.get("book", {}).get("epub_path"),
+            "epub_hash": timeline.get("book", {}).get("epub_hash"),
+            "annots_key": book.get("annots_key") or timeline.get("book", {}).get("annots_key"),
+        },
+        "timeline": {
+            "schema_version": timeline.get("schema_version"),
+            "created_at": timeline.get("created_at"),
+            "region_profile": diagnostics.get("profile"),
+            "region_count": len(timeline.get("regions", [])),
+            "anchor_count": len(timeline.get("anchors", [])),
+        },
+        "expected_boundaries": [
+            {
+                "anchor_boundary": candidate["anchor_boundary"],
+                "source_unit_boundary": candidate.get("source_unit_boundary"),
+                "score": candidate.get("score"),
+                "reasons": candidate.get("reasons", []),
+                "selected": candidate.get("selected", False),
+                "review_expected": None,
+                "noisy_false_positive": False,
+                "note": "",
+            }
+            for candidate in diagnostics.get("boundary_candidates", [])
+            if candidate.get("anchor_boundary", 0) > 0
+        ],
+        "regions": [
+            {
+                "region_id": region["region_id"],
+                "anchor_start": region["anchor_start"],
+                "anchor_end": region["anchor_end"],
+                "boundary_in": region.get("boundary_in"),
+                "boundary_out": region.get("boundary_out"),
+                "preview": region.get("preview"),
+            }
+            for region in timeline.get("regions", [])
+        ],
+    }
+
+
+def apply_region_review_marks(
+    boundary_candidates: list[dict[str, Any]],
+    review: dict[str, Any],
+) -> None:
+    marks = review_marks_by_boundary(review)
+    for candidate in boundary_candidates:
+        mark = marks.get(candidate.get("anchor_boundary"))
+        if not mark:
+            continue
+        if mark.get("review_expected") is True:
+            candidate["score"] = round(max(float(candidate.get("score", 0)), 1.0), 3)
+            if "manual_expected" not in candidate["reasons"]:
+                candidate["reasons"].append("manual_expected")
+        if mark.get("noisy_false_positive") is True:
+            candidate["score"] = 0.0
+            candidate["rejected_reason"] = "manual_noisy_false_positive"
+            if "manual_noisy_false_positive" not in candidate["reasons"]:
+                candidate["reasons"].append("manual_noisy_false_positive")
+
+
+def evaluate_region_review(
+    boundary_candidates: list[dict[str, Any]],
+    review: dict[str, Any],
+) -> dict[str, Any]:
+    selected_edges = {
+        candidate["anchor_boundary"]
+        for candidate in boundary_candidates
+        if candidate.get("selected")
+    }
+    expected_edges = {
+        boundary
+        for boundary, mark in review_marks_by_boundary(review).items()
+        if mark.get("review_expected") is True
+    }
+    noisy_edges = {
+        boundary
+        for boundary, mark in review_marks_by_boundary(review).items()
+        if mark.get("noisy_false_positive") is True
+    }
+    return {
+        "expected_count": len(expected_edges),
+        "expected_selected": sorted(expected_edges & selected_edges),
+        "expected_missed": sorted(expected_edges - selected_edges),
+        "noisy_false_positive_count": len(noisy_edges),
+        "noisy_selected": sorted(noisy_edges & selected_edges),
+        "noisy_rejected": sorted(noisy_edges - selected_edges),
+    }
+
+
+def review_marks_by_boundary(review: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    marks: dict[int, dict[str, Any]] = {}
+    for item in review.get("expected_boundaries", []):
+        boundary = item.get("anchor_boundary")
+        if boundary is not None:
+            marks[int(boundary)] = item
+    return marks
 
 
 def timeline_drift_warnings(book: dict[str, Any], timeline: dict[str, Any]) -> list[str]:
@@ -611,12 +785,12 @@ def build_regions(
             region_start = edge
         elif length < min_anchors:
             if candidate:
-                candidate["rejected_reason"] = "too_short"
+                candidate["rejected_reason"] = candidate.get("rejected_reason") or "too_short"
         elif candidate and candidate["score"] >= threshold:
             selected.append(select_boundary(edge, candidate, None, candidate["score"]))
             region_start = edge
         elif candidate:
-            candidate["rejected_reason"] = "score_below_threshold"
+            candidate["rejected_reason"] = candidate.get("rejected_reason") or "score_below_threshold"
 
     selected.append(book_boundary_candidate(len(anchors), "book_end"))
     regions = []
@@ -689,8 +863,13 @@ def book_boundary_candidate(edge: int, reason: str) -> dict[str, Any]:
 
 def boundary_summary(candidate: dict[str, Any]) -> dict[str, Any]:
     return {
+        "anchor_boundary": candidate["anchor_boundary"],
+        "source_unit_boundary": candidate.get("source_unit_boundary"),
         "score": candidate["score"],
         "reasons": candidate.get("reasons", []),
+        "selected": candidate.get("selected", False),
+        "rejected_reason": candidate.get("rejected_reason"),
+        "snap": candidate.get("snap"),
     }
 
 
