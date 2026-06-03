@@ -3,8 +3,8 @@
 This repo is being rebuilt around a Calibre-native reading-position spine.
 The current active implementation imports a Calibre library, maps EPUB paths to
 Calibre E-book Viewer annotation files, prepares source-aligned anchors and
-deterministic regions, and inspects live EPUB CFI positions against that
-timeline.
+deterministic regions, attaches reviewable deterministic atmosphere labels, and
+inspects live EPUB CFI positions against that timeline.
 
 The previous generic EPUB/chunk/round-robin prototype has been moved to
 `old/prototype/`.
@@ -21,14 +21,15 @@ other than `data`.
 - `list-books`: list imported books, optionally filtering to EPUB-capable
   entries or a title/author/id query.
 - `prepare-book`: extract Calibre-compatible spine text and write a book
-  timeline with source units, anchors, and optional deterministic regions.
+  timeline with source units, anchors, optional deterministic regions, and
+  optional deterministic atmosphere labels.
 - `clean-book`: remove generated timeline, region, or debug sidecar artifacts
   for one imported book.
 
 ```powershell
 python main.py import-calibre "C:\Users\<you>\Calibre Library"
 python main.py list-books --epub-only
-python main.py prepare-book "Book Title" --regions --region-profile normal
+python main.py prepare-book "Book Title" --regions --atmosphere --region-profile normal
 python main.py clean-book "Book Title" --regions
 ```
 
@@ -43,6 +44,7 @@ python main.py clean-book "Book Title" --regions
 
 ```powershell
 python main.py inspect-book "Book Title" --anchors --regions
+python main.py inspect-book "Book Title" --atmosphere
 python main.py inspect-book "Book Title" --live --resolve-cfi --anchors --regions --chain
 python main.py inspect-live --resolve-cfi
 python main.py watch-live --resolve-cfi
@@ -52,8 +54,8 @@ python main.py watch-live --resolve-cfi
 
 - `cfi-fixtures`: list or check captured live CFI fixtures, optionally requiring
   resolved positions to map to prepared anchors.
-- `region-review`: create or check manual region review artifacts for expected
-  boundaries and noisy false-positive transitions.
+- `region-review`: create or check manual review artifacts for expected
+  boundaries, noisy false-positive transitions, and generated atmosphere labels.
 - `annots-key`: compute the Calibre viewer annotation filename for a specific
   EPUB path.
 
@@ -80,22 +82,23 @@ Calibre library EPUB path
 -> boundary reasons
 ```
 
-Semantic labels, audio scores, and the adaptive mixer are intentionally still
-future stages.
+Audio scores, playback, and the adaptive mixer are intentionally still future
+stages.
 
-## Region Review Workflow
+## Region and Atmosphere Review Workflow
 
-The current region system is a deterministic review tool. It does not yet know
-what a scene "means"; it only divides the prepared anchor timeline into larger
+The current region system divides the prepared anchor timeline into larger
 regions using chapter starts, scene separators, pacing shifts, keyword shifts,
-and length limits.
+and length limits. The atmosphere scorer then applies local cue lexicons to
+those regions and records conservative labels, abstentions, evidence anchors,
+and transition churn.
 
 Typical flow:
 
 ```powershell
 python main.py import-calibre "C:\Users\<you>\Calibre Library"
-python main.py prepare-book "The Mirror's Truth" --regions
-python main.py inspect-book "The Mirror's Truth" --anchors --regions --region-limit 20
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere
+python main.py inspect-book "The Mirror's Truth" --anchors --regions --atmosphere --region-limit 20
 python main.py region-review init "The Mirror's Truth"
 ```
 
@@ -111,6 +114,9 @@ Interpret the inspect output in layers:
 - `preview`: the first text from that anchor or region, for quick orientation.
 - `Boundary candidates`: raw diagnostic edges considered by the region builder.
   These are mainly for tuning and review, not the first thing to read.
+- `Atmosphere`: deterministic `setting`, `environment`, `energy`, and `affect`
+  labels, confidence bands, evidence anchors, abstentions, comparator status,
+  and collapsed transition churn.
 
 After `region-review init`, open
 `data/books/<calibre_book_id>/region_review.json`. Mark only boundaries you
@@ -124,9 +130,9 @@ care about:
 Then rebuild and check:
 
 ```powershell
-python main.py prepare-book "The Mirror's Truth" --regions --use-region-review
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --use-region-review
 python main.py region-review check "The Mirror's Truth"
-python main.py inspect-book "The Mirror's Truth" --regions --region-limit 20
+python main.py inspect-book "The Mirror's Truth" --regions --atmosphere --region-limit 20
 ```
 
 Use profiles to compare how aggressively the deterministic builder splits:

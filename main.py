@@ -2,8 +2,8 @@
 Calibre-native adaptive ambience command line.
 
 The rebuilt entry point starts with the coordinate spine:
-Calibre library import, deterministic viewer annotation mapping, and live CFI
-inspection. Semantic regions and audio scoring build on this foundation later.
+Calibre library import, deterministic viewer annotation mapping, live CFI
+inspection, deterministic regions, and reviewable atmosphere labels.
 """
 
 from __future__ import annotations
@@ -105,6 +105,7 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         target_words=args.target_words,
         min_words=args.min_words,
         regions=args.regions,
+        atmosphere=args.atmosphere,
         debug_text=args.debug_text,
         region_profile=args.region_profile,
         region_review=load_region_review(args.data_dir, book["calibre_book_id"]) if args.use_region_review else None,
@@ -120,6 +121,11 @@ def cmd_prepare_book(args: argparse.Namespace) -> int:
         print(f"Region profile: {timeline.get('region_diagnostics', {}).get('profile', args.region_profile)}")
         if args.use_region_review:
             print(f"Region review: {region_review_path(args.data_dir, book['calibre_book_id'])}")
+    if args.atmosphere:
+        atmosphere = timeline.get("atmosphere", {})
+        print(f"Atmosphere labels: {len(atmosphere.get('region_labels', []))}")
+        churn = atmosphere.get("diagnostics", {}).get("transition_churn", {})
+        print(f"Atmosphere transitions: {churn.get('transition_count', 0)}")
     if args.debug_text:
         print(f"Inspect text: {inspect_text_path(args.data_dir, book['calibre_book_id'])}")
     return 0
@@ -157,6 +163,9 @@ def cmd_inspect_book(args: argparse.Namespace) -> int:
 
     if args.regions:
         _print_region_summary(book, args.data_dir, limit=args.region_limit)
+
+    if args.atmosphere:
+        _print_atmosphere_summary(book, args.data_dir, limit=args.region_limit)
 
     if args.live:
         print("\nLive annotation:")
@@ -345,6 +354,8 @@ def cmd_region_review(args: argparse.Namespace) -> int:
         )
         print(f"Region review: {path}")
         print(f"Boundary candidates: {len(timeline.get('region_diagnostics', {}).get('boundary_candidates', []))}")
+        if timeline.get("atmosphere"):
+            print(f"Atmosphere labels: {len(timeline.get('atmosphere', {}).get('region_labels', []))}")
         return 0
 
     if args.review_command == "check":
@@ -362,6 +373,12 @@ def cmd_region_review(args: argparse.Namespace) -> int:
         print(f"  noisy false positives: {result['noisy_false_positive_count']}")
         print(f"  noisy selected: {len(result['noisy_selected'])}")
         print(f"  noisy rejected: {len(result['noisy_rejected'])}")
+        atmosphere_review = evaluate_atmosphere_review(review)
+        if atmosphere_review:
+            print(f"  label-reviewed regions: {atmosphere_review['reviewed_regions']}")
+            print(f"  correct labels marked: {atmosphere_review['correct_label_count']}")
+            print(f"  missing labels marked: {atmosphere_review['missing_label_count']}")
+            print(f"  bad labels marked: {atmosphere_review['bad_label_count']}")
         return 1 if result["expected_missed"] or result["noisy_selected"] else 0
 
     raise ValueError(f"Unknown region-review command: {args.review_command}")
@@ -563,6 +580,70 @@ def _print_region_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -
             )
 
 
+def _print_atmosphere_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -> None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    print("\nAtmosphere:")
+    if not path.exists():
+        print("  No prepared timeline.")
+        return
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    atmosphere = timeline.get("atmosphere")
+    if not atmosphere:
+        print("  No atmosphere labels. Run prepare-book with --regions --atmosphere.")
+        return
+    method = atmosphere.get("method", {})
+    print(f"  Method: {method.get('name')} {method.get('version')}")
+    print(f"  Config hash: {method.get('configuration_hash')}")
+    comparator = method.get("model_assisted_comparator", {})
+    print(f"  Comparator: {comparator.get('status')} ({comparator.get('reason')})")
+    churn = atmosphere.get("diagnostics", {}).get("transition_churn", {})
+    print(
+        "  Churn: "
+        f"regions={churn.get('region_count')} "
+        f"collapsed={churn.get('collapsed_count')} "
+        f"transitions={churn.get('transition_count')}"
+    )
+    for item in atmosphere.get("region_labels", [])[:limit]:
+        print(
+            f"  #{item['region_id']} effective={item.get('effective_atmosphere')} "
+            f"abstained={item.get('abstained')}"
+        )
+        for label in item.get("labels", []):
+            evidence = label.get("evidence", [])
+            print(
+                f"     {label['family']}={label['value']} "
+                f"score={label['score']} confidence={label['confidence']} "
+                f"evidence={len(evidence)}"
+            )
+            if evidence:
+                first = evidence[0]
+                cues = ", ".join(first.get("matched_cues", []))
+                print(f"        anchor {first.get('anchor_id')} cues={cues} preview={first.get('preview', '')}")
+
+
+def evaluate_atmosphere_review(review: dict[str, Any]) -> dict[str, int] | None:
+    regions = review.get("regions", [])
+    if not any(region.get("review_labels") for region in regions):
+        return None
+    reviewed = 0
+    correct = 0
+    missing = 0
+    bad = 0
+    for region in regions:
+        marks = region.get("review_labels") or {}
+        if any(marks.get(key) for key in ("correct_labels", "missing_labels", "bad_labels")) or marks.get("evidence_quality") is not None:
+            reviewed += 1
+        correct += len(marks.get("correct_labels") or [])
+        missing += len(marks.get("missing_labels") or [])
+        bad += len(marks.get("bad_labels") or [])
+    return {
+        "reviewed_regions": reviewed,
+        "correct_label_count": correct,
+        "missing_label_count": missing,
+        "bad_label_count": bad,
+    }
+
+
 def _print_live_anchor(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
     path = timeline_path(data_dir, book["calibre_book_id"])
     print("\nActive anchor:")
@@ -637,6 +718,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--target-words", type=int, default=350)
     p.add_argument("--min-words", type=int, default=180)
     p.add_argument("--regions", action="store_true", help="Build deterministic region records")
+    p.add_argument("--atmosphere", action="store_true", help="Attach deterministic atmosphere labels to regions")
     p.add_argument(
         "--region-profile",
         choices=sorted(REGION_PROFILES),
@@ -664,6 +746,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--resolve-cfi", action="store_true", help="Resolve live CFI with calibre-debug helper")
     p.add_argument("--anchors", action="store_true", help="Show prepared anchor timeline info")
     p.add_argument("--regions", action="store_true", help="Show prepared region timeline info")
+    p.add_argument("--atmosphere", action="store_true", help="Show deterministic atmosphere labels and churn")
     p.add_argument("--anchor-limit", type=int, default=5)
     p.add_argument("--region-limit", type=int, default=5)
     p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")

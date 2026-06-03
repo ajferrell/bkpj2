@@ -9,10 +9,11 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
 
+from .atmosphere import build_atmosphere_extension
 from .cfi_fixtures import file_sha256
 
 
-TIMELINE_SCHEMA_VERSION = 3
+TIMELINE_SCHEMA_VERSION = 4
 REGION_REVIEW_SCHEMA_VERSION = 1
 
 DEFAULT_REGION_CONFIG = {
@@ -97,6 +98,7 @@ def prepare_book_timeline(
     target_words: int = 350,
     min_words: int = 180,
     regions: bool = False,
+    atmosphere: bool = False,
     debug_text: bool = False,
     region_config: Optional[dict[str, Any]] = None,
     region_profile: str = "normal",
@@ -121,6 +123,7 @@ def prepare_book_timeline(
             "target_words": target_words,
             "min_words": min_words,
             "regions": bool(regions),
+            "atmosphere": bool(atmosphere),
             "region_config": config,
         },
         "book": {
@@ -167,6 +170,11 @@ def prepare_book_timeline(
                 result["boundary_candidates"],
                 region_review,
             )
+    elif atmosphere:
+        raise ValueError("--atmosphere requires --regions")
+
+    if atmosphere:
+        timeline["atmosphere"] = build_atmosphere_extension(timeline, anchors)
 
     out_dir = timeline_dir(data_dir, book["calibre_book_id"])
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -240,6 +248,7 @@ def build_region_review_artifact(book: dict[str, Any], timeline: dict[str, Any])
             "region_profile": diagnostics.get("profile"),
             "region_count": len(timeline.get("regions", [])),
             "anchor_count": len(timeline.get("anchors", [])),
+            "atmosphere_schema_version": timeline.get("atmosphere", {}).get("schema_version"),
         },
         "expected_boundaries": [
             {
@@ -263,9 +272,25 @@ def build_region_review_artifact(book: dict[str, Any], timeline: dict[str, Any])
                 "boundary_in": region.get("boundary_in"),
                 "boundary_out": region.get("boundary_out"),
                 "preview": region.get("preview"),
+                "atmosphere": atmosphere_by_region_id(timeline).get(region["region_id"]),
+                "review_labels": {
+                    "correct_labels": [],
+                    "missing_labels": [],
+                    "bad_labels": [],
+                    "evidence_quality": None,
+                    "audio_change_useful": None,
+                    "note": "",
+                },
             }
             for region in timeline.get("regions", [])
         ],
+    }
+
+
+def atmosphere_by_region_id(timeline: dict[str, Any]) -> dict[int, dict[str, Any]]:
+    return {
+        int(item["region_id"]): item
+        for item in timeline.get("atmosphere", {}).get("region_labels", [])
     }
 
 
@@ -460,9 +485,18 @@ def remove_regions_from_timeline(data_dir: str | Path, calibre_book_id: int | st
     if "regions" in timeline:
         timeline.pop("regions")
         changed = True
+    if "region_diagnostics" in timeline:
+        timeline.pop("region_diagnostics")
+        changed = True
+    if "atmosphere" in timeline:
+        timeline.pop("atmosphere")
+        changed = True
     builder = timeline.setdefault("builder", {})
     if builder.get("regions") is not False:
         builder["regions"] = False
+        changed = True
+    if builder.get("atmosphere") is not False:
+        builder["atmosphere"] = False
         changed = True
     if changed:
         with open(path, "w", encoding="utf-8") as f:

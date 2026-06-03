@@ -28,6 +28,7 @@ from src.anchors import (
     timeline_path,
     write_region_review_artifact,
 )
+from src.atmosphere import build_atmosphere_extension, transition_churn
 from src.calibre_native import LiveAnnotation
 
 
@@ -142,7 +143,7 @@ def test_prepare_book_timeline_with_fake_extractor(tmp_path):
     timeline = load_timeline(tmp_path / "data", 42)
 
     assert path.exists()
-    assert timeline["schema_version"] == 3
+    assert timeline["schema_version"] == 4
     assert timeline["book"]["title"] == "Book"
     assert len(timeline["source_units"]) == 2
     assert len(timeline["anchors"]) == 1
@@ -214,6 +215,107 @@ def test_prepare_book_timeline_can_write_regions(tmp_path):
 
     assert timeline["regions"]
     assert timeline["regions"][0]["boundary_in"]["reasons"] == ["book_start"]
+
+
+def test_prepare_book_timeline_can_write_atmosphere_without_full_text(tmp_path):
+    book = fake_book(tmp_path, 51)
+
+    def fake_extractor(epub_path):
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join([
+                    "Rain and thunder filled the forest road.",
+                    "The storm wind crossed the dark field.",
+                    "Inside the room, the engine ticked quietly.",
+                    "The machine hummed beside the closed door.",
+                ]),
+            },
+            {
+                "spine_index": 1,
+                "href": "chapter2.xhtml",
+                "text": "\n\n".join([
+                    "The sword fight spilled blood across the hall.",
+                    "They ran from the attack and shouted in fear.",
+                    "Silence returned and the quiet room grew still.",
+                    "A soft hush settled after the danger passed.",
+                ]),
+            },
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=tmp_path / "data",
+        target_words=8,
+        min_words=1,
+        regions=True,
+        atmosphere=True,
+        spine_extractor=fake_extractor,
+    )
+    timeline = load_timeline(tmp_path / "data", 51)
+    labels = timeline["atmosphere"]["region_labels"]
+
+    assert timeline["schema_version"] == 4
+    assert timeline["builder"]["atmosphere"] is True
+    assert len(labels) == len(timeline["regions"])
+    assert timeline["atmosphere"]["method"]["configuration_hash"]
+    assert timeline["atmosphere"]["method"]["model_assisted_comparator"]["status"] == "not_run"
+    assert timeline["atmosphere"]["diagnostics"]["transition_churn"]["region_count"] == len(labels)
+    assert "plain" not in timeline["anchors"][0]["text"]
+    assert any(
+        label["evidence"]
+        for item in labels
+        for label in item["labels"]
+        if label["value"] != "unknown"
+    )
+
+
+def test_atmosphere_requires_regions(tmp_path):
+    book = fake_book(tmp_path, 52)
+
+    def fake_extractor(epub_path):
+        return [{"spine_index": 0, "href": "chapter.xhtml", "text": "Quiet room."}]
+
+    try:
+        prepare_book_timeline(
+            book,
+            data_dir=tmp_path / "data",
+            atmosphere=True,
+            spine_extractor=fake_extractor,
+        )
+    except ValueError as exc:
+        assert "--atmosphere requires --regions" in str(exc)
+    else:
+        raise AssertionError("prepare_book_timeline should reject atmosphere without regions")
+
+
+def test_atmosphere_abstains_when_cues_are_weak():
+    anchors = [
+        {
+            "anchor_id": 0,
+            "text": {"plain": "Alpha beta gamma.", "preview": "Alpha beta gamma.", "word_count": 3},
+        }
+    ]
+    timeline = {
+        "regions": [
+            {
+                "region_id": 0,
+                "anchor_start": 0,
+                "anchor_end": 1,
+                "boundary_in": {"reasons": ["book_start"]},
+                "boundary_out": {"reasons": ["book_end"]},
+                "stats": {"anchor_count": 1},
+            }
+        ]
+    }
+
+    atmosphere = build_atmosphere_extension(timeline, anchors)
+    item = atmosphere["region_labels"][0]
+
+    assert item["abstained"] is True
+    assert item["effective_atmosphere"] == "unknown"
+    assert all(label["value"] == "unknown" for label in item["labels"])
 
 
 def test_prepare_book_timeline_debug_text_includes_boundary_candidates(tmp_path):
@@ -327,7 +429,7 @@ def test_region_review_marks_suppress_noisy_and_force_expected_boundaries():
 def test_region_review_artifact_marks_expected_boundaries(tmp_path):
     book = fake_book(tmp_path, 50)
     timeline = {
-        "schema_version": 3,
+        "schema_version": 4,
         "created_at": "2026-06-03T12:00:00",
         "book": {"epub_path": book["preferred_epub_path"], "epub_hash": "hash", "annots_key": "abc.json"},
         "anchors": [{"anchor_id": 0}, {"anchor_id": 1}],
@@ -347,6 +449,40 @@ def test_region_review_artifact_marks_expected_boundaries(tmp_path):
     assert artifact["expected_boundaries"][0]["review_expected"] is None
     assert region_review_path(tmp_path / "data", 50) == path
     assert json.loads(path.read_text(encoding="utf-8"))["regions"][0]["preview"] == "Alpha"
+
+
+def test_region_review_artifact_includes_atmosphere_review_fields(tmp_path):
+    book = fake_book(tmp_path, 53)
+    timeline = {
+        "schema_version": 4,
+        "created_at": "2026-06-03T12:00:00",
+        "book": {"epub_path": book["preferred_epub_path"], "epub_hash": "hash", "annots_key": "abc.json"},
+        "anchors": [{"anchor_id": 0}],
+        "regions": [{"region_id": 0, "anchor_start": 0, "anchor_end": 1, "boundary_in": {}, "boundary_out": {}, "preview": "Rain"}],
+        "region_diagnostics": {"profile": "normal", "boundary_candidates": []},
+        "atmosphere": {
+            "schema_version": 1,
+            "region_labels": [{"region_id": 0, "labels": [], "effective_atmosphere": "unknown", "abstained": True}],
+        },
+    }
+
+    artifact = build_region_review_artifact(book, timeline)
+
+    assert artifact["timeline"]["atmosphere_schema_version"] == 1
+    assert artifact["regions"][0]["atmosphere"]["effective_atmosphere"] == "unknown"
+    assert artifact["regions"][0]["review_labels"]["audio_change_useful"] is None
+
+
+def test_transition_churn_collapses_adjacent_equivalent_atmospheres():
+    churn = transition_churn([
+        {"region_id": 0, "effective_atmosphere": "setting:exterior"},
+        {"region_id": 1, "effective_atmosphere": "setting:exterior"},
+        {"region_id": 2, "effective_atmosphere": "environment:fire"},
+    ])
+
+    assert churn["collapsed_count"] == 2
+    assert churn["transition_count"] == 1
+    assert churn["collapsed_regions"][0]["region_ids"] == [0, 1]
 
 
 def test_region_ranges_cover_all_anchors_exactly_once_and_enforce_maximum():
