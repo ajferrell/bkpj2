@@ -12,7 +12,12 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Optional
 
-from .calibre_native import LiveAnnotation, find_book_by_annots_key, newest_live_annotation
+from .calibre_native import (
+    LiveAnnotation,
+    compute_annots_key,
+    find_book_by_annots_key,
+    newest_live_annotation,
+)
 
 
 ProbeRunner = Callable[[Optional[str], str], dict[str, Any]]
@@ -176,12 +181,21 @@ def check_fixture(
         failures.append("epub_missing")
         resolved = None
     else:
+        current_key = compute_annots_key(epub_path)
+        recorded_key = book.get("annots_key")
+        live_key = live.get("annots_key")
+        if recorded_key and current_key != recorded_key:
+            warnings.append(f"annots_key_drift expected={recorded_key} actual={current_key}")
+        if live_key and recorded_key and Path(live_key).name != Path(recorded_key).name:
+            warnings.append(f"live_annots_key_mismatch book={recorded_key} live={live_key}")
+
         expected_hash = book.get("epub_hash")
-        if expected_hash and file_sha256(epub_path) != expected_hash:
+        actual_hash = file_sha256(epub_path)
+        if expected_hash and actual_hash != expected_hash:
             if strict_hash:
-                failures.append("epub_hash_changed")
+                failures.append(f"epub_hash_changed expected={expected_hash} actual={actual_hash}")
             else:
-                warnings.append("epub_hash_changed")
+                warnings.append(f"epub_hash_changed expected={expected_hash} actual={actual_hash}")
         resolved = probe_runner(epub_path, cfi)
         if resolved.get("error"):
             failures.append(f"probe_error: {resolved['error']}")

@@ -9,11 +9,13 @@ inspection. Semantic regions and audio scoring build on this foundation later.
 from __future__ import annotations
 
 import argparse
+import json
 import sys
 from pathlib import Path
 from typing import Any
 
 from src.calibre_native import (
+    annotation_file_diagnostics,
     compute_annots_key,
     default_calibre_annots_dir,
     find_book,
@@ -26,12 +28,14 @@ from src.calibre_native import (
 from src.anchors import (
     find_anchor_for_position,
     find_region_for_anchor,
+    inspect_position_chain,
     inspect_text_path,
     load_timeline,
     prepare_book_timeline,
     remove_inspect_text,
     remove_regions_from_timeline,
     remove_timeline,
+    timeline_drift_warnings,
     timeline_path,
 )
 from src.cfi_fixtures import (
@@ -137,6 +141,7 @@ def cmd_clean_book(args: argparse.Namespace) -> int:
 def cmd_inspect_book(args: argparse.Namespace) -> int:
     book = find_book(args.query, args.data_dir)
     _print_book(book)
+    _print_timeline_drift(book, args.data_dir)
 
     if args.anchors:
         _print_anchor_summary(book, args.data_dir, limit=args.anchor_limit)
@@ -149,7 +154,9 @@ def cmd_inspect_book(args: argparse.Namespace) -> int:
         live = read_live_annotation_for_book(book, annots_dir=args.annots_dir)
         if not live:
             print("  No live annotation file/position found for this book.")
-            print(f"  Expected: {(Path(args.annots_dir) if args.annots_dir else default_calibre_annots_dir()) / (book.get('annots_key') or '')}")
+            expected = (Path(args.annots_dir) if args.annots_dir else default_calibre_annots_dir()) / (book.get("annots_key") or "")
+            print(f"  Expected: {expected}")
+            _print_annotation_diagnostics(expected)
             return 0
         _print_live(live)
 
@@ -161,6 +168,15 @@ def cmd_inspect_book(args: argparse.Namespace) -> int:
                 _print_live_anchor(book, result, args.data_dir)
             if args.regions and not result.get("error"):
                 _print_live_region(book, result, args.data_dir)
+            if args.chain:
+                print("\nCoordinate chain:")
+                _print_position_chain(book, args.data_dir, live=live, resolved=result, as_json=args.json)
+        elif args.chain:
+            print("\nCoordinate chain:")
+            _print_position_chain(book, args.data_dir, live=live, resolved=None, as_json=args.json)
+    elif args.chain:
+        print("\nCoordinate chain:")
+        _print_position_chain(book, args.data_dir, live=None, resolved=None, as_json=args.json)
 
     return 0
 
@@ -188,6 +204,12 @@ def cmd_inspect_live(args: argparse.Namespace) -> int:
         print("\nCalibre CFI probe:")
         result = run_calibre_cfi_probe(book.get("preferred_epub_path"), live.epubcfi)
         _print_probe_result(result)
+    else:
+        result = None
+
+    if args.chain:
+        print("\nCoordinate chain:")
+        _print_position_chain(book, args.data_dir, live=live, resolved=result, as_json=args.json)
 
     return 0
 
@@ -342,6 +364,92 @@ def _print_probe_result(result: dict[str, Any]) -> None:
             print(f"    {line}")
 
 
+def _print_annotation_diagnostics(path: Path) -> None:
+    diagnostics = annotation_file_diagnostics(path)
+    print("  Annotation diagnostics:")
+    print(f"    exists: {diagnostics['exists']}")
+    print(f"    json_ok: {diagnostics['json_ok']}")
+    print(f"    candidate_count: {diagnostics['candidate_count']}")
+    if diagnostics.get("error"):
+        print(f"    error: {diagnostics['error']}")
+
+
+def _load_timeline_if_present(book: dict[str, Any], data_dir: str) -> dict[str, Any] | None:
+    path = timeline_path(data_dir, book["calibre_book_id"])
+    if not path.exists():
+        return None
+    return load_timeline(data_dir, book["calibre_book_id"])
+
+
+def _print_timeline_drift(book: dict[str, Any], data_dir: str) -> None:
+    timeline = _load_timeline_if_present(book, data_dir)
+    if not timeline:
+        return
+    warnings = timeline_drift_warnings(book, timeline)
+    if warnings:
+        print("\nTimeline drift warnings:")
+        for warning in warnings:
+            print(f"  - {warning}")
+
+
+def _print_position_chain(
+    book: dict[str, Any],
+    data_dir: str,
+    live: Any | None,
+    resolved: dict[str, Any] | None,
+    as_json: bool = False,
+) -> None:
+    timeline = _load_timeline_if_present(book, data_dir)
+    chain = inspect_position_chain(book, timeline=timeline, live=live, resolved=resolved)
+    if as_json:
+        print(json.dumps(chain, indent=2, ensure_ascii=False))
+        return
+
+    print(f"  book.epub_path: {chain['book'].get('epub_path')}")
+    print(f"  book.annots_key: {chain['book'].get('annots_key')}")
+    if chain.get("live"):
+        print(f"  live.epubcfi: {chain['live'].get('epubcfi')}")
+    else:
+        print("  live: not available")
+    if chain.get("resolved"):
+        resolved_view = chain["resolved"]
+        if resolved_view.get("error"):
+            print(f"  resolved.error: {resolved_view['error']}")
+        else:
+            print(
+                "  resolved: "
+                f"spine={resolved_view.get('spine_index')} "
+                f"href={resolved_view.get('href')} "
+                f"offset={resolved_view.get('local_char_offset')}"
+            )
+    else:
+        print("  resolved: not available")
+    if chain.get("anchor"):
+        anchor = chain["anchor"]
+        print(
+            "  anchor: "
+            f"#{anchor.get('anchor_id')} "
+            f"spine={anchor.get('spine_index')} "
+            f"offsets={anchor.get('start_local_offset')}-{anchor.get('end_local_offset')}"
+        )
+        print(f"  anchor.preview: {anchor.get('preview')}")
+    else:
+        print("  anchor: not available")
+    if chain.get("region"):
+        region = chain["region"]
+        print(
+            "  region: "
+            f"#{region.get('region_id')} "
+            f"anchors={region.get('anchor_start')}-{region.get('anchor_end')} "
+            f"active_anchor={region.get('active_anchor')}"
+        )
+        print(f"  region.preview: {region.get('preview')}")
+    else:
+        print("  region: not available")
+    for warning in chain.get("warnings", []):
+        print(f"  warning: {warning}")
+
+
 def _print_anchor_summary(book: dict[str, Any], data_dir: str, limit: int = 5) -> None:
     path = timeline_path(data_dir, book["calibre_book_id"])
     print("\nAnchor timeline:")
@@ -482,11 +590,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--anchor-limit", type=int, default=5)
     p.add_argument("--region-limit", type=int, default=5)
     p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.add_argument("--chain", action="store_true", help="Show the full coordinate chain in one structured view")
+    p.add_argument("--json", action="store_true", help="Print --chain as JSON")
     p.set_defaults(func=cmd_inspect_book)
 
     p = sub.add_parser("inspect-live", help="Inspect newest live Calibre viewer position")
     p.add_argument("--resolve-cfi", action="store_true", help="Resolve live CFI with calibre-debug helper")
     p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.add_argument("--chain", action="store_true", help="Show the full coordinate chain in one structured view")
+    p.add_argument("--json", action="store_true", help="Print --chain as JSON")
     p.set_defaults(func=cmd_inspect_live)
 
     p = sub.add_parser("watch-live", help="Watch live Calibre viewer position")

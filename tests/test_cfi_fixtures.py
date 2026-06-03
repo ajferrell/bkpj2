@@ -1,5 +1,4 @@
 import json
-import uuid
 from pathlib import Path
 
 from src.calibre_native import LiveAnnotation
@@ -9,12 +8,6 @@ from src.cfi_fixtures import (
     check_fixture,
     slugify,
 )
-
-
-def scratch_path() -> Path:
-    path = Path(".test_tmp") / uuid.uuid4().hex
-    path.mkdir(parents=True, exist_ok=False)
-    return path
 
 
 def make_book(epub: Path) -> dict:
@@ -47,8 +40,7 @@ def make_resolved() -> dict:
     }
 
 
-def test_build_fixture_stores_expected_probe_values():
-    tmp_path = scratch_path()
+def test_build_fixture_stores_expected_probe_values(tmp_path):
     epub = tmp_path / "book.epub"
     epub.write_bytes(b"fake epub")
 
@@ -61,8 +53,7 @@ def test_build_fixture_stores_expected_probe_values():
     assert fixture["expected"]["preview_contains"] == "Blood beads where buzzing metal pinches my scalp."
 
 
-def test_capture_and_check_fixture_passes_with_same_probe():
-    tmp_path = scratch_path()
+def test_capture_and_check_fixture_passes_with_same_probe(tmp_path):
     epub = tmp_path / "book.epub"
     epub.write_bytes(b"fake epub")
     path = capture_live_fixture(
@@ -83,8 +74,7 @@ def test_capture_and_check_fixture_passes_with_same_probe():
     assert result["failures"] == []
 
 
-def test_check_fixture_reports_mismatches():
-    tmp_path = scratch_path()
+def test_check_fixture_reports_mismatches(tmp_path):
     epub = tmp_path / "book.epub"
     epub.write_bytes(b"fake epub")
     fixture = build_fixture("bad", make_live(), make_book(epub), make_resolved())
@@ -101,8 +91,7 @@ def test_check_fixture_reports_mismatches():
     assert any("local_char_offset_mismatch" in f for f in result["failures"])
 
 
-def test_check_fixture_treats_hash_change_as_warning_by_default(tmp_path=None):
-    tmp_path = scratch_path()
+def test_check_fixture_treats_hash_change_as_warning_by_default(tmp_path):
     epub = tmp_path / "book.epub"
     epub.write_bytes(b"fake epub")
     fixture = build_fixture("hash warning", make_live(), make_book(epub), make_resolved())
@@ -112,11 +101,27 @@ def test_check_fixture_treats_hash_change_as_warning_by_default(tmp_path=None):
 
     result = check_fixture(path, probe_runner=lambda epub_path, cfi: make_resolved())
     assert result["ok"]
-    assert "epub_hash_changed" in result["warnings"]
+    assert any(w.startswith("epub_hash_changed") for w in result["warnings"])
 
     strict = check_fixture(path, probe_runner=lambda epub_path, cfi: make_resolved(), strict_hash=True)
     assert not strict["ok"]
-    assert "epub_hash_changed" in strict["failures"]
+    assert any(f.startswith("epub_hash_changed") for f in strict["failures"])
+
+
+def test_check_fixture_warns_when_epub_path_changes_annots_key(tmp_path):
+    epub = tmp_path / "book.epub"
+    epub.write_bytes(b"fake epub")
+    fixture = build_fixture("path drift", make_live(), make_book(epub), make_resolved())
+    moved = tmp_path / "moved.epub"
+    moved.write_bytes(epub.read_bytes())
+    fixture["book"]["epub_path"] = str(moved)
+    path = tmp_path / "path-drift.json"
+    path.write_text(json.dumps(fixture), encoding="utf-8")
+
+    result = check_fixture(path, probe_runner=lambda epub_path, cfi: make_resolved())
+
+    assert result["ok"]
+    assert any(w.startswith("annots_key_drift") for w in result["warnings"])
 
 
 def test_slugify_has_timestamp_fallback_shape():

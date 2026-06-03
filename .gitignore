@@ -2,6 +2,7 @@ __pycache__/
 .pytest_tmp/
 .pytest_cache/
 .test_tmp/
+test_tmp_runtime/
 *.pyc
 *.pyo
 *.log

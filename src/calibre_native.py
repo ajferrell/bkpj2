@@ -260,25 +260,49 @@ def newest_live_annotation(
 
 def read_live_annotation_file(path: str | Path) -> Optional[LiveAnnotation]:
     annot_path = Path(path)
-    if not annot_path.exists():
+    diagnostics = annotation_file_diagnostics(annot_path)
+    latest = diagnostics.get("latest")
+    if not latest:
         return None
 
-    data = _read_json_robustly(annot_path)
-    if data is None:
-        return None
-
-    candidates = list(_walk_annotation_entries(data))
-    candidates.sort(key=lambda x: x[1], reverse=True)
-    if not candidates:
-        return None
-
-    epubcfi, timestamp = candidates[0]
+    epubcfi, timestamp = latest
     return LiveAnnotation(
         annots_key=annot_path.name,
         annots_path=str(annot_path),
         epubcfi=epubcfi,
         timestamp=timestamp,
     )
+
+
+def annotation_file_diagnostics(path: str | Path) -> dict[str, Any]:
+    annot_path = Path(path)
+    diagnostics: dict[str, Any] = {
+        "path": str(annot_path),
+        "exists": annot_path.exists(),
+        "json_ok": False,
+        "candidate_count": 0,
+        "latest": None,
+        "error": None,
+    }
+    if not annot_path.exists():
+        diagnostics["error"] = "annotation_file_missing"
+        return diagnostics
+
+    data = _read_json_robustly(annot_path)
+    if data is None:
+        diagnostics["error"] = "annotation_json_unreadable"
+        return diagnostics
+
+    diagnostics["json_ok"] = True
+    candidates = list(_walk_annotation_entries(data))
+    candidates.sort(key=lambda x: x[1], reverse=True)
+    diagnostics["candidate_count"] = len(candidates)
+    if not candidates:
+        diagnostics["error"] = "last_read_cfi_missing"
+        return diagnostics
+
+    diagnostics["latest"] = candidates[0]
+    return diagnostics
 
 
 def _walk_annotation_entries(value: Any) -> Iterable[tuple[str, float]]:

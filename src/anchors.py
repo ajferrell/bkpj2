@@ -153,6 +153,114 @@ def load_timeline(data_dir: str | Path, calibre_book_id: int | str) -> dict[str,
         return json.load(f)
 
 
+def timeline_drift_warnings(book: dict[str, Any], timeline: dict[str, Any]) -> list[str]:
+    """Return warnings when the manifest/book identity diverges from a timeline."""
+    warnings: list[str] = []
+    timeline_book = timeline.get("book", {})
+    manifest_epub = book.get("preferred_epub_path")
+    timeline_epub = timeline_book.get("epub_path")
+    if manifest_epub and timeline_epub and str(manifest_epub) != str(timeline_epub):
+        warnings.append(f"epub_path_changed manifest={manifest_epub} timeline={timeline_epub}")
+    if manifest_epub and Path(manifest_epub).exists():
+        current_hash = file_sha256(manifest_epub)
+        timeline_hash = timeline_book.get("epub_hash")
+        if timeline_hash and current_hash != timeline_hash:
+            warnings.append(f"epub_hash_changed timeline={timeline_hash} actual={current_hash}")
+    elif manifest_epub:
+        warnings.append(f"epub_missing path={manifest_epub}")
+    manifest_key = book.get("annots_key")
+    timeline_key = timeline_book.get("annots_key")
+    if manifest_key and timeline_key and manifest_key != timeline_key:
+        warnings.append(f"annots_key_changed manifest={manifest_key} timeline={timeline_key}")
+    return warnings
+
+
+def inspect_position_chain(
+    book: dict[str, Any],
+    timeline: dict[str, Any] | None = None,
+    live: Any | None = None,
+    resolved: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Build one structured coordinate chain view for CLI inspection."""
+    chain: dict[str, Any] = {
+        "book": {
+            "calibre_book_id": book.get("calibre_book_id"),
+            "calibre_uuid": book.get("calibre_uuid"),
+            "title": book.get("title"),
+            "authors": book.get("authors") or [],
+            "epub_path": book.get("preferred_epub_path"),
+            "annots_key": book.get("annots_key"),
+        },
+        "timeline": None,
+        "live": None,
+        "resolved": None,
+        "anchor": None,
+        "region": None,
+        "warnings": [],
+    }
+    if timeline is not None:
+        chain["timeline"] = {
+            "schema_version": timeline.get("schema_version"),
+            "created_at": timeline.get("created_at"),
+            "epub_path": timeline.get("book", {}).get("epub_path"),
+            "epub_hash": timeline.get("book", {}).get("epub_hash"),
+            "spine_count": len(timeline.get("spine", [])),
+            "source_unit_count": len(timeline.get("source_units", [])),
+            "anchor_count": len(timeline.get("anchors", [])),
+            "region_count": len(timeline.get("regions", [])),
+        }
+        chain["warnings"].extend(timeline_drift_warnings(book, timeline))
+    if live is not None:
+        chain["live"] = {
+            "annots_path": getattr(live, "annots_path", None),
+            "annots_key": getattr(live, "annots_key", None),
+            "epubcfi": getattr(live, "epubcfi", None),
+            "timestamp": getattr(live, "timestamp", None),
+        }
+        if book.get("annots_key") and getattr(live, "annots_key", None) != book.get("annots_key"):
+            chain["warnings"].append(
+                f"live_annots_key_mismatch book={book.get('annots_key')} live={getattr(live, 'annots_key', None)}"
+            )
+    if resolved is not None:
+        chain["resolved"] = {
+            key: resolved.get(key)
+            for key in ("spine_index", "href", "local_char_offset", "spine_text_len", "text_preview", "error")
+            if key in resolved
+        }
+    if timeline is not None and resolved and not resolved.get("error"):
+        anchor = find_anchor_for_position(
+            timeline,
+            spine_index=resolved["spine_index"],
+            local_char_offset=resolved["local_char_offset"],
+        )
+        if anchor is not None:
+            pos = anchor["position"]
+            text = anchor["text"]
+            chain["anchor"] = {
+                "anchor_id": anchor["anchor_id"],
+                "spine_index": pos["spine_index"],
+                "href": pos["href"],
+                "start_local_offset": pos["start_local_offset"],
+                "end_local_offset": pos["end_local_offset"],
+                "word_count": text.get("word_count"),
+                "preview": text.get("preview"),
+            }
+            region = find_region_for_anchor(timeline, anchor["anchor_id"])
+            if region is not None:
+                chain["region"] = {
+                    "region_id": region["region_id"],
+                    "anchor_start": region["anchor_start"],
+                    "anchor_end": region["anchor_end"],
+                    "active_anchor": anchor["anchor_id"],
+                    "boundary_in": region.get("boundary_in"),
+                    "boundary_out": region.get("boundary_out"),
+                    "preview": region.get("preview"),
+                }
+        else:
+            chain["warnings"].append("anchor_not_found")
+    return chain
+
+
 def remove_timeline(data_dir: str | Path, calibre_book_id: int | str) -> bool:
     path = timeline_path(data_dir, calibre_book_id)
     if not path.exists():
