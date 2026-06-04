@@ -51,6 +51,12 @@ FAMILY_CATEGORY_MAP = {
     },
 }
 
+PLANNER_ASSET_CATEGORIES = sorted({
+    category
+    for family in FAMILY_CATEGORY_MAP.values()
+    for category in family.values()
+})
+
 
 def audio_asset_catalog_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return Path(data_dir) / "books" / str(calibre_book_id) / "audio_assets.json"
@@ -131,25 +137,36 @@ def build_audio_intents(
     for region in timeline.get("regions", []):
         atmosphere = atmosphere_by_region.get(region["region_id"])
         query = asset_query_for_region(region, atmosphere)
-        base_asset = select_asset(assets, "base_bed", query["base_categories"], query["intensity"])
-        layers = [
-            layer
+        requested_base_category = query["base_categories"][0] if query["base_categories"] else "neutral"
+        base_selection = select_asset_with_category(
+            assets,
+            "base_bed",
+            query["base_categories"],
+            query["intensity"],
+        )
+        forced_default_fallback = False
+        if base_selection is None:
+            base_selection = select_asset_with_category(assets, "base_bed", ["neutral"], 0.0)
+        if base_selection is None:
+            base_selection = (default_asset_catalog()["assets"][0], "neutral")
+            forced_default_fallback = True
+        base_asset, matched_base_category = base_selection
+        fallback = forced_default_fallback or matched_base_category != requested_base_category
+        layer_selections = [
+            selection
             for category in query["layer_categories"]
-            if (layer := select_asset(assets, "layer", [category], query["intensity"])) is not None
+            if (selection := select_asset_with_category(assets, "layer", [category], query["intensity"])) is not None
         ]
-        fallback = base_asset is None
-        if fallback:
-            base_asset = select_asset(assets, "base_bed", ["neutral"], 0.0)
-        if base_asset is None:
-            base_asset = default_asset_catalog()["assets"][0]
-            fallback = True
+        base_intent = intent_asset(base_asset, matched_base_category)
+        if fallback and matched_base_category != requested_base_category:
+            base_intent["fallback_from_category"] = requested_base_category
         intents.append({
             "schema_version": AUDIO_INTENT_SCHEMA_VERSION,
             "intent_id": f"region-{region['region_id']}",
             "region_id": region["region_id"],
             "effective_atmosphere": query["effective_atmosphere"],
-            "base_bed": intent_asset(base_asset, query["base_categories"][0] if query["base_categories"] else "neutral"),
-            "layers": [intent_asset(layer, category) for layer, category in zip(layers, query["layer_categories"])],
+            "base_bed": base_intent,
+            "layers": [intent_asset(layer, category) for layer, category in layer_selections],
             "intensity": query["intensity"],
             "fade_in_seconds": cfg["fade_in_seconds"],
             "fade_out_seconds": cfg["fade_out_seconds"],
@@ -235,6 +252,19 @@ def select_asset(assets: list[dict[str, Any]], role: str, categories: list[str],
     return None
 
 
+def select_asset_with_category(
+    assets: list[dict[str, Any]],
+    role: str,
+    categories: list[str],
+    intensity: float,
+) -> tuple[dict[str, Any], str] | None:
+    for category in categories:
+        asset = select_asset(assets, role, [category], intensity)
+        if asset is not None:
+            return asset, category
+    return None
+
+
 def intent_asset(asset: dict[str, Any], matched_category: str) -> dict[str, Any]:
     return {
         "asset_id": asset["asset_id"],
@@ -243,6 +273,52 @@ def intent_asset(asset: dict[str, Any], matched_category: str) -> dict[str, Any]
         "default_gain": asset["default_gain"],
         "role": asset["role"],
     }
+
+
+def catalog_coverage_report(catalog: dict[str, Any]) -> dict[str, Any]:
+    assets = catalog.get("assets", [])
+    duplicate_asset_ids = sorted({
+        asset.get("asset_id")
+        for asset in assets
+        if sum(1 for item in assets if item.get("asset_id") == asset.get("asset_id")) > 1
+    })
+    coverage = {}
+    for category in PLANNER_ASSET_CATEGORIES:
+        base_assets = matching_catalog_assets(assets, category, "base_bed")
+        layer_assets = matching_catalog_assets(assets, category, "layer")
+        coverage[category] = {
+            "base_bed_count": len(base_assets),
+            "layer_count": len(layer_assets),
+            "base_bed_assets": [asset["asset_id"] for asset in base_assets],
+            "layer_assets": [asset["asset_id"] for asset in layer_assets],
+        }
+    return {
+        "schema_version": catalog.get("schema_version"),
+        "asset_count": len(assets),
+        "categories": coverage,
+        "missing_base_bed_categories": [
+            category for category, info in coverage.items() if info["base_bed_count"] == 0
+        ],
+        "missing_layer_categories": [
+            category for category, info in coverage.items() if info["layer_count"] == 0
+        ],
+        "provenance_pending_assets": [
+            asset["asset_id"]
+            for asset in assets
+            if "pending" in str(asset.get("license", "")).casefold()
+        ],
+        "duplicate_asset_ids": duplicate_asset_ids,
+    }
+
+
+def matching_catalog_assets(assets: list[dict[str, Any]], category: str, role: str) -> list[dict[str, Any]]:
+    return [
+        asset
+        for asset in assets
+        if asset.get("role") == role
+        and asset.get("loopable", False)
+        and category in asset.get("categories", [])
+    ]
 
 
 def simulate_reading_trace(

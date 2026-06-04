@@ -42,8 +42,9 @@ python main.py clean-book "Book Title" --regions
   back to an imported book.
 - `watch-live`: poll the newest viewer position and optionally capture CFI
   fixtures while reading.
-- `audio-plan`: inspect planned declarative audio intents or simulate reading
-  traces against transition controls.
+- `audio-plan`: inspect planned declarative audio intents, simulate reading
+  traces against transition controls, or report asset catalog bed/layer
+  coverage.
 - `audio-runtime`: inspect loaded runtime assets or manually play one prepared
   audio intent through the local sounddevice backend.
 
@@ -55,6 +56,7 @@ python main.py inspect-live --resolve-cfi
 python main.py watch-live --resolve-cfi
 python main.py audio-plan inspect "Book Title"
 python main.py audio-plan simulate "Book Title"
+python main.py audio-plan catalog "Book Title"
 python main.py audio-runtime inspect "Book Title"
 python main.py audio-runtime play "Book Title" --duration-seconds 30
 ```
@@ -116,6 +118,7 @@ python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-
 python main.py inspect-book "The Mirror's Truth" --anchors --regions --atmosphere --region-limit 20
 python main.py audio-plan inspect "The Mirror's Truth"
 python main.py audio-plan simulate "The Mirror's Truth"
+python main.py audio-plan catalog "The Mirror's Truth"
 python main.py audio-runtime inspect "The Mirror's Truth"
 python main.py region-review init "The Mirror's Truth"
 ```
@@ -158,6 +161,7 @@ python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-
 python main.py region-review check "The Mirror's Truth"
 python main.py inspect-book "The Mirror's Truth" --regions --atmosphere --region-limit 20
 python main.py audio-plan inspect "The Mirror's Truth"
+python main.py audio-plan catalog "The Mirror's Truth"
 python main.py audio-runtime inspect "The Mirror's Truth"
 ```
 
@@ -186,6 +190,38 @@ The planner can use `data/books/<calibre_book_id>/audio_assets.json` or an
 explicit `--asset-catalog` path. If no usable local catalog is present, it uses
 a built-in neutral silent fallback so planner inspection still works.
 
+Use `audio-plan catalog` to report which planner categories have base-bed and
+layer coverage in a catalog:
+
+```powershell
+python main.py audio-plan catalog "The Mirror's Truth" --asset-catalog ".\data\audio_library\pilot_catalogs\ambience-pilot-v1.json"
+```
+
+The catalog, not the WAV file itself, determines whether an asset can be used as
+a base bed or a layer. Each asset entry has one `role`: `base_bed` or `layer`.
+The same WAV can appear twice with different `asset_id` values when it is useful
+in both roles:
+
+```json
+{
+  "asset_id": "fire_01_bed",
+  "path": "../normalized/fire_01.wav",
+  "role": "base_bed",
+  "categories": ["fire"],
+  "default_gain": 0.05
+}
+```
+
+```json
+{
+  "asset_id": "fire_01",
+  "path": "../normalized/fire_01.wav",
+  "role": "layer",
+  "categories": ["fire"],
+  "default_gain": 0.08
+}
+```
+
 ## Runtime Audio Preview
 
 Phase 5 adds local playback, but only as a manual preview of already-prepared
@@ -196,9 +232,10 @@ To hear anything other than silence, provide an asset catalog with local audio
 files:
 
 ```powershell
-python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-intents --asset-catalog ".\data\books\5\audio_assets.json"
-python main.py audio-runtime inspect "The Mirror's Truth" --asset-catalog ".\data\books\5\audio_assets.json"
-python main.py audio-runtime play "The Mirror's Truth" --asset-catalog ".\data\books\5\audio_assets.json" --region-id 0 --duration-seconds 30
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-intents --asset-catalog ".\data\audio_library\pilot_catalogs\ambience-pilot-v1.json"
+python main.py audio-plan catalog "The Mirror's Truth" --asset-catalog ".\data\audio_library\pilot_catalogs\ambience-pilot-v1.json"
+python main.py audio-runtime inspect "The Mirror's Truth" --asset-catalog ".\data\audio_library\pilot_catalogs\ambience-pilot-v1.json"
+python main.py audio-runtime play "The Mirror's Truth" --asset-catalog ".\data\audio_library\pilot_catalogs\ambience-pilot-v1.json" --region-id 0 --duration-seconds 30
 ```
 
 Runtime asset requirements:

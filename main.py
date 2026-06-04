@@ -48,6 +48,7 @@ from src.anchors import (
 from src.audio_planner import (
     audio_asset_catalog_path,
     build_audio_intents,
+    catalog_coverage_report,
     load_asset_catalog,
     simulate_reading_trace,
 )
@@ -407,11 +408,30 @@ def cmd_region_review(args: argparse.Namespace) -> int:
 
 def cmd_audio_plan(args: argparse.Namespace) -> int:
     book = find_book(args.query, args.data_dir)
+    catalog_path = args.asset_catalog or audio_asset_catalog_path(args.data_dir, book["calibre_book_id"])
+    catalog = load_asset_catalog(catalog_path)
+    if args.plan_command == "catalog":
+        report = catalog_coverage_report(catalog)
+        print(f"Catalog assets: {report['asset_count']}")
+        print(f"Schema version: {report.get('schema_version')}")
+        print(f"Provenance pending: {len(report['provenance_pending_assets'])}")
+        if report["duplicate_asset_ids"]:
+            print(f"Duplicate asset ids: {', '.join(report['duplicate_asset_ids'])}")
+        print("Categories:")
+        for category, info in report["categories"].items():
+            print(
+                f"  {category}: "
+                f"base_beds={info['base_bed_count']} "
+                f"layers={info['layer_count']}"
+            )
+        if report["missing_base_bed_categories"]:
+            print(f"Missing base beds: {', '.join(report['missing_base_bed_categories'])}")
+        if report["missing_layer_categories"]:
+            print(f"Missing layers: {', '.join(report['missing_layer_categories'])}")
+        return 0
     timeline = load_timeline(args.data_dir, book["calibre_book_id"])
     if not timeline.get("regions"):
         raise ValueError("Timeline has no regions. Run prepare-book with --regions.")
-    catalog_path = args.asset_catalog or audio_asset_catalog_path(args.data_dir, book["calibre_book_id"])
-    catalog = load_asset_catalog(catalog_path)
     planned = timeline.get("audio_intents") or build_audio_intents(timeline, catalog)
     if args.plan_command == "inspect":
         print(f"Audio intents: {len(planned.get('intents', []))}")
@@ -918,7 +938,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_region_review)
 
     p = sub.add_parser("audio-plan", help="Inspect or simulate declarative audio intents")
-    p.add_argument("plan_command", choices=["inspect", "simulate"])
+    p.add_argument("plan_command", choices=["inspect", "simulate", "catalog"])
     p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
     p.add_argument("--asset-catalog", help="Path to an audio asset catalog JSON")
     p.add_argument("--trace", help="JSON trace with region_id/time_seconds polls")

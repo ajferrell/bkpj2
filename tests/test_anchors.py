@@ -31,7 +31,7 @@ from src.anchors import (
     timeline_path,
     write_region_review_artifact,
 )
-from src.audio_planner import build_audio_intents, simulate_reading_trace
+from src.audio_planner import build_audio_intents, catalog_coverage_report, simulate_reading_trace
 from src.atmosphere import build_atmosphere_extension, transition_churn
 from src.calibre_native import LiveAnnotation
 
@@ -775,6 +775,98 @@ def test_audio_intents_use_neutral_fallback_for_unknown_or_unmatched_assets():
     assert intent["effective_atmosphere"] == "unknown"
     assert intent["base_bed"]["matched_category"] == "neutral"
     assert intent["suppression_reason"] == "neutral_fallback"
+
+
+def test_audio_intent_base_fallback_reports_actual_matched_category():
+    timeline = {
+        "regions": [{"region_id": 0, "anchor_start": 0, "anchor_end": 1, "stats": {"anchor_count": 1}}],
+        "atmosphere": {
+            "region_labels": [
+                {
+                    "region_id": 0,
+                    "effective_atmosphere": "environment:fire|energy:combat",
+                    "abstained": False,
+                    "labels": [
+                        {"family": "environment", "value": "fire", "confidence": "high"},
+                        {"family": "energy", "value": "combat", "confidence": "high"},
+                    ],
+                }
+            ]
+        },
+    }
+    catalog = {
+        "schema_version": 1,
+        "assets": [
+            {
+                "asset_id": "neutral",
+                "path": "",
+                "license": "test fixture",
+                "loopable": True,
+                "role": "base_bed",
+                "categories": ["neutral"],
+                "intensity_min": 0.0,
+                "intensity_max": 1.0,
+                "default_gain": 0.0,
+            },
+            {
+                "asset_id": "combat",
+                "path": "",
+                "license": "test fixture",
+                "loopable": True,
+                "role": "layer",
+                "categories": ["combat"],
+                "intensity_min": 0.0,
+                "intensity_max": 1.0,
+                "default_gain": 0.1,
+            },
+        ],
+    }
+
+    intent = build_audio_intents(timeline, catalog)["intents"][0]
+
+    assert intent["base_bed"]["asset_id"] == "neutral"
+    assert intent["base_bed"]["matched_category"] == "neutral"
+    assert intent["base_bed"]["fallback_from_category"] == "fire"
+    assert intent["layers"][0]["asset_id"] == "combat"
+    assert intent["layers"][0]["matched_category"] == "combat"
+
+
+def test_catalog_coverage_report_shows_role_specific_category_gaps():
+    catalog = {
+        "schema_version": 1,
+        "assets": [
+            {
+                "asset_id": "fire-bed",
+                "path": "fire.wav",
+                "license": "test fixture",
+                "loopable": True,
+                "role": "base_bed",
+                "categories": ["fire"],
+                "intensity_min": 0.0,
+                "intensity_max": 1.0,
+                "default_gain": 0.1,
+            },
+            {
+                "asset_id": "fire-layer",
+                "path": "fire.wav",
+                "license": "test fixture",
+                "loopable": True,
+                "role": "layer",
+                "categories": ["fire"],
+                "intensity_min": 0.0,
+                "intensity_max": 1.0,
+                "default_gain": 0.1,
+            },
+        ],
+    }
+
+    report = catalog_coverage_report(catalog)
+
+    assert report["categories"]["fire"]["base_bed_assets"] == ["fire-bed"]
+    assert report["categories"]["fire"]["layer_assets"] == ["fire-layer"]
+    assert "fire" not in report["missing_base_bed_categories"]
+    assert "fire" not in report["missing_layer_categories"]
+    assert "combat" in report["missing_base_bed_categories"]
 
 
 def test_audio_trace_simulation_suppresses_repeated_and_short_jumps():
