@@ -1,0 +1,12 @@
+[run]
+branch = True
+data_file = test_tmp_runtime/.coverage
+source =
+    src
+
+[report]
+show_missing = True
+skip_covered = True
+omit =
+    src/calibre/cfi_helper.py
+    src/calibre/anchor_helper.py

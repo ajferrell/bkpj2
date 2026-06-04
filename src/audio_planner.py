@@ -92,11 +92,28 @@ def validate_asset_catalog(catalog: dict[str, Any]) -> None:
     if catalog.get("schema_version") != AUDIO_ASSET_CATALOG_SCHEMA_VERSION:
         raise ValueError("Unsupported audio asset catalog schema_version")
     for asset in catalog.get("assets", []):
-        for key in ("asset_id", "path", "license", "loopable", "role", "categories", "default_gain"):
+        for key in (
+            "asset_id",
+            "path",
+            "license",
+            "loopable",
+            "role",
+            "categories",
+            "intensity_min",
+            "intensity_max",
+            "default_gain",
+        ):
             if key not in asset:
                 raise ValueError(f"Audio asset missing {key}: {asset}")
         if asset["role"] not in {"base_bed", "layer"}:
             raise ValueError(f"Unsupported asset role: {asset['role']}")
+        if not isinstance(asset["categories"], list) or not asset["categories"]:
+            raise ValueError(f"Audio asset categories must be a non-empty list: {asset}")
+        if float(asset["intensity_min"]) > float(asset["intensity_max"]):
+            raise ValueError(f"Audio asset intensity_min exceeds intensity_max: {asset}")
+        gain = float(asset["default_gain"])
+        if gain < 0.0 or gain > 1.0:
+            raise ValueError(f"Audio asset default_gain must be normalized 0..1: {asset}")
 
 
 def build_audio_intents(

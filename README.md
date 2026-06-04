@@ -3,9 +3,9 @@
 This repo is being rebuilt around a Calibre-native reading-position spine.
 The current active implementation imports a Calibre library, maps EPUB paths to
 Calibre E-book Viewer annotation files, prepares source-aligned anchors and
-deterministic regions, attaches reviewable deterministic atmosphere labels, and
-plans restrained declarative audio intents that can be inspected before any
-runtime playback exists.
+deterministic regions, attaches reviewable deterministic atmosphere labels,
+plans restrained declarative audio intents, and can manually preview those
+intents through a local audio runtime.
 
 The previous generic EPUB/chunk/round-robin prototype has been moved to
 `old/prototype/`.
@@ -44,6 +44,8 @@ python main.py clean-book "Book Title" --regions
   fixtures while reading.
 - `audio-plan`: inspect planned declarative audio intents or simulate reading
   traces against transition controls.
+- `audio-runtime`: inspect loaded runtime assets or manually play one prepared
+  audio intent through the local sounddevice backend.
 
 ```powershell
 python main.py inspect-book "Book Title" --anchors --regions
@@ -53,6 +55,8 @@ python main.py inspect-live --resolve-cfi
 python main.py watch-live --resolve-cfi
 python main.py audio-plan inspect "Book Title"
 python main.py audio-plan simulate "Book Title"
+python main.py audio-runtime inspect "Book Title"
+python main.py audio-runtime play "Book Title" --duration-seconds 30
 ```
 
 ### Fixtures and Review
@@ -87,10 +91,12 @@ Calibre library EPUB path
 -> boundary reasons
 -> atmosphere summary
 -> audio intent
+-> manual runtime preview
 ```
 
-Actual sound output and the adaptive mixer are intentionally still future
-stages.
+Live Calibre-driven ambience is still a future stage. Manual playback of a
+prepared intent exists now, but it does not yet follow your live reading
+position.
 
 ## Region, Atmosphere, and Intent Review Workflow
 
@@ -110,6 +116,7 @@ python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-
 python main.py inspect-book "The Mirror's Truth" --anchors --regions --atmosphere --region-limit 20
 python main.py audio-plan inspect "The Mirror's Truth"
 python main.py audio-plan simulate "The Mirror's Truth"
+python main.py audio-runtime inspect "The Mirror's Truth"
 python main.py region-review init "The Mirror's Truth"
 ```
 
@@ -131,6 +138,9 @@ Interpret the inspect output in layers:
 - `Audio intents`: planner-facing ambience instructions. Unknown labels,
   missing asset catalogs, or unmatched categories resolve to neutral fallback
   intents instead of hard failures.
+- `Audio runtime`: local playback for one prepared intent at a time. It loads
+  assets before playback, mixes a base bed plus optional layers, applies fades,
+  and keeps disk/JSON/Calibre work out of the audio callback.
 
 After `region-review init`, open
 `data/books/<calibre_book_id>/region_review.json`. Mark only boundaries you
@@ -148,6 +158,7 @@ python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-
 python main.py region-review check "The Mirror's Truth"
 python main.py inspect-book "The Mirror's Truth" --regions --atmosphere --region-limit 20
 python main.py audio-plan inspect "The Mirror's Truth"
+python main.py audio-runtime inspect "The Mirror's Truth"
 ```
 
 Use profiles to compare how aggressively the deterministic builder splits:
@@ -174,3 +185,55 @@ review data is written to sidecars:
 The planner can use `data/books/<calibre_book_id>/audio_assets.json` or an
 explicit `--asset-catalog` path. If no usable local catalog is present, it uses
 a built-in neutral silent fallback so planner inspection still works.
+
+## Runtime Audio Preview
+
+Phase 5 adds local playback, but only as a manual preview of already-prepared
+audio intents. Phase 6 is what will connect live Calibre reading position to
+region lookup, planner transitions, and continuous playback.
+
+To hear anything other than silence, provide an asset catalog with local audio
+files:
+
+```powershell
+python main.py prepare-book "The Mirror's Truth" --regions --atmosphere --audio-intents --asset-catalog ".\data\books\5\audio_assets.json"
+python main.py audio-runtime inspect "The Mirror's Truth" --asset-catalog ".\data\books\5\audio_assets.json"
+python main.py audio-runtime play "The Mirror's Truth" --asset-catalog ".\data\books\5\audio_assets.json" --region-id 0 --duration-seconds 30
+```
+
+Runtime asset requirements:
+
+- `audio_assets.json` uses schema version `1`.
+- Each playable asset must be loopable 16-bit PCM `.wav`.
+- The default runtime expects 44100 Hz stereo. Override with
+  `--sample-rate` and `--channels` only if your catalog was prepared that way.
+- Assets are mixed as normalized float32 with conservative `default_gain`.
+- Empty or missing planner assets produce silence/neutral fallback.
+- Unsupported files or mismatched sample rate/channel count are rejected before
+  playback starts.
+
+Minimal catalog shape:
+
+```json
+{
+  "schema_version": 1,
+  "created_at": "2026-06-03T16:00:00",
+  "assets": [
+    {
+      "asset_id": "quiet_room_bed",
+      "path": "audio/quiet_room.wav",
+      "license": "local test asset",
+      "loopable": true,
+      "role": "base_bed",
+      "categories": ["neutral", "quiet", "interior"],
+      "intensity_min": 0.0,
+      "intensity_max": 1.0,
+      "default_gain": 0.25
+    }
+  ]
+}
+```
+
+As-is, if you run `audio-runtime play` without a real matching catalog, the
+command can start the runtime but you should expect silence because the built-in
+fallback is intentionally silent.

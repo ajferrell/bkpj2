@@ -51,6 +51,12 @@ from src.audio_planner import (
     load_asset_catalog,
     simulate_reading_trace,
 )
+from src.audio_runtime import (
+    AudioMixer,
+    RuntimeConfig,
+    SoundDeviceBackend,
+    load_runtime_assets,
+)
 from src.cfi_fixtures import (
     capture_live_fixture,
     check_fixtures,
@@ -433,6 +439,48 @@ def cmd_audio_plan(args: argparse.Namespace) -> int:
     raise ValueError(f"Unknown audio-plan command: {args.plan_command}")
 
 
+def cmd_audio_runtime(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    timeline = load_timeline(args.data_dir, book["calibre_book_id"])
+    planned = timeline.get("audio_intents")
+    if not planned:
+        raise ValueError("Timeline has no audio_intents. Run prepare-book with --regions --audio-intents.")
+    catalog_path = args.asset_catalog or audio_asset_catalog_path(args.data_dir, book["calibre_book_id"])
+    catalog = load_asset_catalog(catalog_path)
+    config = RuntimeConfig(sample_rate=args.sample_rate, channels=args.channels)
+    assets = load_runtime_assets(catalog, catalog_path=catalog_path, config=config)
+    mixer = AudioMixer(assets, config=config)
+    intent = select_runtime_intent(planned.get("intents", []), args.intent_id, args.region_id)
+    mixer.set_intent(intent)
+
+    if args.runtime_command == "inspect":
+        print(f"Runtime assets loaded: {len(assets)}")
+        print(f"Selected intent: {intent.get('intent_id')} region={intent.get('region_id')}")
+        print(f"Layers prepared: {len(mixer.current_layers) + len(mixer.target_layers)}")
+        for message in mixer.status_messages:
+            print(f"  fallback: {message}")
+        return 0
+    if args.runtime_command == "play":
+        import time
+
+        try:
+            backend = SoundDeviceBackend(mixer, device=args.device)
+            backend.start()
+        except Exception as exc:
+            print(f"Audio device unavailable; runtime fell back to silence: {exc}", file=sys.stderr)
+            return 1
+        try:
+            print(f"Playing {intent.get('intent_id')} for {args.duration_seconds} seconds. Press Ctrl+C to stop.")
+            time.sleep(args.duration_seconds)
+        except KeyboardInterrupt:
+            print("\nStopped.")
+        finally:
+            backend.stop()
+            backend.close()
+        return 0
+    raise ValueError(f"Unknown audio-runtime command: {args.runtime_command}")
+
+
 def cmd_annots_key(args: argparse.Namespace) -> int:
     print(compute_annots_key(args.epub_path))
     return 0
@@ -707,6 +755,26 @@ def load_trace(path: str | None, intents: list[dict[str, Any]]) -> list[dict[str
     return trace
 
 
+def select_runtime_intent(
+    intents: list[dict[str, Any]],
+    intent_id: str | None = None,
+    region_id: int | None = None,
+) -> dict[str, Any]:
+    if not intents:
+        raise ValueError("No audio intents are available.")
+    if intent_id:
+        for intent in intents:
+            if intent.get("intent_id") == intent_id:
+                return intent
+        raise ValueError(f"Audio intent not found: {intent_id}")
+    if region_id is not None:
+        for intent in intents:
+            if int(intent.get("region_id")) == region_id:
+                return intent
+        raise ValueError(f"Audio intent region not found: {region_id}")
+    return intents[0]
+
+
 def _print_live_anchor(book: dict[str, Any], result: dict[str, Any], data_dir: str) -> None:
     path = timeline_path(data_dir, book["calibre_book_id"])
     print("\nActive anchor:")
@@ -856,6 +924,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--trace", help="JSON trace with region_id/time_seconds polls")
     p.add_argument("--limit", type=int, default=10)
     p.set_defaults(func=cmd_audio_plan)
+
+    p = sub.add_parser("audio-runtime", help="Inspect or play local audio runtime intents")
+    p.add_argument("runtime_command", choices=["inspect", "play"])
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--asset-catalog", help="Path to an audio asset catalog JSON")
+    p.add_argument("--intent-id", help="Prepared intent id to play")
+    p.add_argument("--region-id", type=int, help="Prepared region id to play")
+    p.add_argument("--sample-rate", type=int, default=44100)
+    p.add_argument("--channels", type=int, default=2)
+    p.add_argument("--device", help="sounddevice output device id or query string")
+    p.add_argument("--duration-seconds", type=float, default=30.0)
+    p.set_defaults(func=cmd_audio_runtime)
 
     p = sub.add_parser("annots-key", help="Compute Calibre viewer annots filename for an EPUB path")
     p.add_argument("epub_path")
