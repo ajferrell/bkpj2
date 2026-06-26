@@ -1,4 +1,4 @@
-"""Calibre-native adaptive ambience core."""
+"""Calibre-native book-to-query core."""
 
 from .calibre_native import (
     CalibreBook,
