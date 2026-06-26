@@ -4,10 +4,8 @@ bkpj2 is the book-to-audio-query side of a local reading-audio workflow.
 
 The current code imports a Calibre library, reads live Calibre E-book Viewer
 positions, resolves EPUB CFIs through Calibre helpers, prepares text-block
-timelines, and inspects how a live CFI maps back to book text. The next
-implementation target is to turn those resolved book spans into compact
-audio-intent query records that can be reviewed and sent to
-`music-retrieval-lab` for local audio retrieval.
+timelines, inspects how a live CFI maps back to book text, and exports compact
+manual audio-intent query records for review or downstream local retrieval.
 
 ## Setup
 
@@ -53,6 +51,18 @@ Inspect prepared and live position data:
 .\.venv\Scripts\python.exe main.py watch-live --resolve-cfi
 ```
 
+Export one manual query record from an explicit resolved coordinate:
+
+```powershell
+.\.venv\Scripts\python.exe main.py export-query "Book Title" --spine-index 12 --local-char-offset 2450 --query-text "dark, quiet instrumental tension; sparse low strings; no vocals"
+```
+
+Export one manual query record from the current live Calibre position:
+
+```powershell
+.\.venv\Scripts\python.exe main.py export-query "Book Title" --live --query-file .\query.txt
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -87,8 +97,10 @@ Main local artifacts:
   treat these records as text blocks.
 - `data/books/<calibre_book_id>/inspect_text.json`: optional full-text debug
   sidecar written only with `prepare-book --debug-text`.
+- `data/books/<calibre_book_id>/query_records.jsonl`: manual query handoff
+  records containing book identity, text-block span provenance, capped excerpt,
+  query text, handoff target, and review status.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
-The planned query handoff artifact does not exist yet. The target shape is
-defined in [docs/SPEC.md](docs/SPEC.md), and the task queue is in
-[docs/TASKS.md](docs/TASKS.md).
+The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The
+task queue is in [docs/TASKS.md](docs/TASKS.md).

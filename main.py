@@ -40,6 +40,14 @@ from src.cfi_fixtures import (
     run_calibre_cfi_probe,
     timestamp_name,
 )
+from src.query_export import (
+    append_query_record,
+    build_query_record,
+    build_query_span,
+    drift_warnings_for_export,
+    load_text_blocks_for_export,
+    query_records_path,
+)
 
 
 def cmd_import_calibre(args: argparse.Namespace) -> int:
@@ -311,8 +319,89 @@ def cmd_annots_key(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_query(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    timeline = load_timeline_with_sidecars(args.data_dir, book["calibre_book_id"])
+    warnings = drift_warnings_for_export(book, timeline)
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    live = None
+    if args.live:
+        live = read_live_annotation_for_book(book, annots_dir=args.annots_dir)
+        if not live:
+            raise ValueError("No live annotation position found for this book")
+        resolved = run_calibre_cfi_probe(book.get("preferred_epub_path"), live.epubcfi)
+        if resolved.get("error"):
+            raise ValueError(f"Could not resolve live CFI: {resolved['error']}")
+        source_cfi = live.epubcfi
+        selection_method = "live_cfi_expand_text_blocks_v1"
+    else:
+        if args.spine_index is None or args.local_char_offset is None:
+            raise ValueError("Use --live or provide both --spine-index and --local-char-offset")
+        href = _href_for_spine(timeline, args.spine_index)
+        resolved = {
+            "spine_index": args.spine_index,
+            "href": href,
+            "local_char_offset": args.local_char_offset,
+            "resolver": "manual",
+        }
+        source_cfi = args.source_cfi
+        selection_method = "manual_resolved_position_v1"
+
+    query_text = _read_query_text(args)
+    text_blocks = load_text_blocks_for_export(args.data_dir, book, timeline=timeline)
+    span = build_query_span(
+        book=book,
+        timeline=timeline,
+        text_blocks=text_blocks,
+        spine_index=int(resolved["spine_index"]),
+        local_char_offset=int(resolved["local_char_offset"]),
+        source_cfi=source_cfi,
+        resolved_position=resolved,
+        selection_method=selection_method,
+        target_words=args.target_words,
+        min_words=args.min_words,
+        max_words=args.max_words,
+    )
+    record = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=span,
+        query_text=query_text,
+        negative_text=args.negative_text or "",
+        review_status=args.review_status,
+    )
+    output = Path(args.output) if args.output else query_records_path(args.data_dir, book["calibre_book_id"])
+    append_query_record(output, record)
+
+    print(f"Exported query record: {record['record_id']}")
+    print(f"Span: {span['span_id']} words={span['word_count']} blocks={span['text_block_start']}-{span['text_block_end']}")
+    print(f"Output: {output}")
+    if live:
+        print(f"Source CFI: {live.epubcfi}")
+    return 0
+
+
 def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
     return {"cfi": epubcfi, "probe_skipped": True}
+
+
+def _read_query_text(args: argparse.Namespace) -> str:
+    if args.query_text and args.query_file:
+        raise ValueError("Use either --query-text or --query-file, not both")
+    if args.query_file:
+        return Path(args.query_file).read_text(encoding="utf-8").strip()
+    if args.query_text:
+        return args.query_text.strip()
+    raise ValueError("Provide manual query text with --query-text or --query-file")
+
+
+def _href_for_spine(timeline: dict[str, Any], spine_index: int) -> str | None:
+    for item in timeline.get("spine", []):
+        if item.get("spine_index") == spine_index:
+            return item.get("href")
+    return None
 
 
 def _print_book(book: dict[str, Any]) -> None:
@@ -531,6 +620,23 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("annots-key", help="Compute Calibre viewer annots filename for an EPUB path")
     p.add_argument("epub_path")
     p.set_defaults(func=cmd_annots_key)
+
+    p = sub.add_parser("export-query", help="Export one manual audio-intent query JSONL record")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--live", action="store_true", help="Use this book's current live Calibre CFI position")
+    p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.add_argument("--spine-index", type=int, help="Resolved spine index for manual coordinate export")
+    p.add_argument("--local-char-offset", type=int, help="Resolved local character offset for manual coordinate export")
+    p.add_argument("--source-cfi", help="Optional source CFI to store with a manual resolved coordinate")
+    p.add_argument("--query-text", help="Manual compact audio-intent query text")
+    p.add_argument("--query-file", help="File containing manual compact audio-intent query text")
+    p.add_argument("--negative-text", default="", help="Optional negative query text")
+    p.add_argument("--output", help="JSONL output path; defaults to the prepared book data directory")
+    p.add_argument("--target-words", type=int, default=800, help="Preferred query span size")
+    p.add_argument("--min-words", type=int, default=500, help="Minimum query span size before stopping at max")
+    p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
+    p.add_argument("--review-status", default="unreviewed", help="Initial review status stored in the record")
+    p.set_defaults(func=cmd_export_query)
 
     return parser
 
