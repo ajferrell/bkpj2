@@ -9,6 +9,7 @@ from src.anchors import (
 )
 from src.calibre_native import save_manifest
 from src.query_export import (
+    build_batch_query_spans,
     build_query_record,
     build_query_span,
     drift_warnings_for_export,
@@ -163,6 +164,64 @@ def test_query_record_is_schema_valid_and_stable(tmp_path):
     assert record["query"]["generation_method"] == "manual_v1"
 
 
+def test_batch_query_spans_cover_blocks_without_overlap(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+
+    spans = build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        target_words=14,
+        min_words=8,
+        max_words=20,
+    )
+
+    covered = []
+    for span in spans:
+        assert span["selection_method"] == "batch_text_blocks_v1"
+        assert span["source_cfi"] is None
+        assert span["text_block_start"] < span["text_block_end"]
+        covered.extend(range(span["text_block_start"], span["text_block_end"]))
+
+    assert covered == [0, 1, 2, 3, 4]
+    assert len(covered) == len(set(covered))
+    assert spans[0]["spine_index"] == 0
+    assert spans[-1]["spine_index"] == 1
+
+
+def test_empty_needs_query_record_is_schema_valid(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    span = build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        max_spans=1,
+        target_words=14,
+        min_words=8,
+        max_words=20,
+    )[0]
+
+    record = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=span,
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+
+    assert validate_query_record(record) == []
+    assert record["record_id"].endswith("-q-needs-query")
+    assert record["query"]["text"] == ""
+    assert record["review"]["status"] == "needs_query"
+
+
 def test_drift_warnings_are_exposed_for_export(tmp_path):
     book, data_dir = prepare_fake_book(tmp_path)
     timeline = load_timeline(data_dir, book["calibre_book_id"])
@@ -217,3 +276,44 @@ def test_export_query_cli_writes_one_jsonl_record(tmp_path, capsys):
     assert query_records_path(data_dir, 42).parent.exists()
     captured = capsys.readouterr()
     assert "Exported query record:" in captured.out
+
+
+def test_export_batch_spans_cli_writes_needs_query_records(tmp_path, capsys):
+    book, data_dir = prepare_fake_book(tmp_path)
+    manifest = {
+        "libraries": [str(tmp_path)],
+        "books": [book],
+    }
+    save_manifest(manifest, data_dir=data_dir)
+    output = tmp_path / "batch_queries.jsonl"
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "export-batch-spans",
+            "42",
+            "--target-words",
+            "14",
+            "--min-words",
+            "8",
+            "--max-words",
+            "20",
+            "--max-spans",
+            "2",
+            "--output",
+            str(output),
+        ]
+    )
+
+    assert args.func(args) == 0
+
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 2
+    assert records[0]["query"]["mode"] == "needs_query"
+    assert records[0]["query"]["text"] == ""
+    assert records[0]["query"]["generation_method"] == "batch_placeholder_v1"
+    assert records[0]["review"]["status"] == "needs_query"
+    assert records[0]["span"]["selection_method"] == "batch_text_blocks_v1"
+    captured = capsys.readouterr()
+    assert "Exported batch query span records: 2" in captured.out

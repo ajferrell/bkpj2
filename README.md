@@ -63,6 +63,12 @@ Export one manual query record from the current live Calibre position:
 .\.venv\Scripts\python.exe main.py export-query "Book Title" --live --query-file .\query.txt
 ```
 
+Export deterministic query-span candidates for manual query authoring:
+
+```powershell
+.\.venv\Scripts\python.exe main.py export-batch-spans "Book Title" --target-words 800 --max-spans 20
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -97,9 +103,9 @@ Main local artifacts:
   treat these records as text blocks.
 - `data/books/<calibre_book_id>/inspect_text.json`: optional full-text debug
   sidecar written only with `prepare-book --debug-text`.
-- `data/books/<calibre_book_id>/query_records.jsonl`: manual query handoff
-  records containing book identity, text-block span provenance, capped excerpt,
-  query text, handoff target, and review status.
+- `data/books/<calibre_book_id>/query_records.jsonl`: query handoff records
+  containing book identity, text-block span provenance, capped excerpt, query
+  text or `needs_query` placeholders, handoff target, and review status.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
 The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The

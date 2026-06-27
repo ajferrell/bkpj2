@@ -105,21 +105,81 @@ def build_query_span(
             end_pos = choice
         word_count += candidate_words
 
-    selected = spine_blocks[start_pos : end_pos + 1]
-    first = selected[0]
-    last = selected[-1]
-    plain_text = "\n\n".join((unit.get("_text") or unit.get("preview") or "").strip() for unit in selected).strip()
-    excerpt = _cap_text(plain_text, excerpt_char_limit)
-    span_id = (
-        f"book-{book.get('calibre_book_id')}-spine-{spine_index}-"
-        f"tb-{first['unit_id']}-{last['unit_id'] + 1}"
-    )
     resolved = resolved_position or {
         "spine_index": spine_index,
-        "href": first.get("href"),
+        "href": spine_blocks[focus_pos].get("href"),
         "local_char_offset": local_char_offset,
         "resolver": "manual",
     }
+    return _build_span_from_block_range(
+        book=book,
+        spine_blocks=spine_blocks,
+        start_pos=start_pos,
+        end_pos=end_pos,
+        source_cfi=source_cfi,
+        resolved_position=resolved,
+        selection_method=selection_method,
+        excerpt_char_limit=excerpt_char_limit,
+    )
+
+
+def build_batch_query_spans(
+    *,
+    book: dict[str, Any],
+    timeline: dict[str, Any],
+    text_blocks: list[dict[str, Any]],
+    spine_index: int | None = None,
+    href: str | None = None,
+    target_words: int = 800,
+    min_words: int = 500,
+    max_words: int = 1200,
+    max_spans: int | None = None,
+    excerpt_char_limit: int = DEFAULT_EXCERPT_CHAR_LIMIT,
+) -> list[dict[str, Any]]:
+    """Build deterministic, non-overlapping query span candidates."""
+    if target_words <= 0 or min_words <= 0 or max_words <= 0:
+        raise ValueError("Span word limits must be positive")
+    if min_words > max_words:
+        raise ValueError("--min-words cannot exceed --max-words")
+    if max_spans is not None and max_spans <= 0:
+        raise ValueError("--max-spans must be positive")
+
+    blocks = sorted(text_blocks, key=lambda unit: (unit.get("spine_index"), unit.get("unit_id")))
+    if spine_index is not None:
+        blocks = [unit for unit in blocks if unit.get("spine_index") == spine_index]
+    if href is not None:
+        blocks = [unit for unit in blocks if unit.get("href") == href]
+    if not blocks:
+        raise ValueError("No text blocks matched the batch export filters")
+
+    spans: list[dict[str, Any]] = []
+    for spine_blocks in _blocks_by_spine_href(blocks):
+        for start_pos, end_pos in _batch_ranges_for_spine(
+            spine_blocks,
+            target_words=target_words,
+            min_words=min_words,
+            max_words=max_words,
+        ):
+            first = spine_blocks[start_pos]
+            span = _build_span_from_block_range(
+                book=book,
+                spine_blocks=spine_blocks,
+                start_pos=start_pos,
+                end_pos=end_pos,
+                source_cfi=None,
+                resolved_position={
+                    "spine_index": first.get("spine_index"),
+                    "href": first.get("href"),
+                    "local_char_offset": first.get("start_local_offset"),
+                    "resolver": "batch_text_blocks_v1",
+                },
+                selection_method="batch_text_blocks_v1",
+                excerpt_char_limit=excerpt_char_limit,
+            )
+            spans.append(span)
+            if max_spans is not None and len(spans) >= max_spans:
+                return spans
+    return spans
 
     return {
         "span_id": span_id,
@@ -154,14 +214,15 @@ def build_query_record(
     query_mode: str = "manual",
     generation_method: str = "manual_v1",
     review_status: str = "unreviewed",
+    allow_empty_query: bool = False,
 ) -> dict[str, Any]:
     query = query_text.strip()
-    if not query:
+    if not query and not allow_empty_query:
         raise ValueError("Manual query text cannot be empty")
 
     timeline_book = timeline.get("book", {})
     book_id = timeline_book.get("calibre_book_id") or book.get("calibre_book_id")
-    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12] if query else "needs-query"
     record_id = f"book-{book_id}-{span['span_id']}-q-{query_hash}"
     return {
         "schema_version": QUERY_RECORD_SCHEMA_VERSION,
@@ -219,7 +280,8 @@ def validate_query_record(record: dict[str, Any]) -> list[str]:
         if key not in span:
             errors.append(f"missing_span_{key}")
     query = record.get("query") or {}
-    if not (query.get("text") or "").strip():
+    review = record.get("review") or {}
+    if not (query.get("text") or "").strip() and review.get("status") != "needs_query":
         errors.append("query_text_empty")
     if record.get("handoff", {}).get("target") != "music-retrieval-lab":
         errors.append("handoff_target_invalid")
@@ -281,6 +343,110 @@ def _merge_extracted_text(
         enriched["_text"] = extracted.get("_text", "")
         merged.append(enriched)
     return merged
+
+
+def _build_span_from_block_range(
+    *,
+    book: dict[str, Any],
+    spine_blocks: list[dict[str, Any]],
+    start_pos: int,
+    end_pos: int,
+    source_cfi: str | None,
+    resolved_position: dict[str, Any],
+    selection_method: str,
+    excerpt_char_limit: int,
+) -> dict[str, Any]:
+    selected = spine_blocks[start_pos : end_pos + 1]
+    first = selected[0]
+    last = selected[-1]
+    plain_text = "\n\n".join((unit.get("_text") or unit.get("preview") or "").strip() for unit in selected).strip()
+    excerpt = _cap_text(plain_text, excerpt_char_limit)
+    span_id = (
+        f"book-{book.get('calibre_book_id')}-spine-{first.get('spine_index')}-"
+        f"tb-{first['unit_id']}-{last['unit_id'] + 1}"
+    )
+
+    return {
+        "span_id": span_id,
+        "spine_index": first.get("spine_index"),
+        "href": first.get("href"),
+        "start_local_offset": first.get("start_local_offset"),
+        "end_local_offset": last.get("end_local_offset"),
+        "text_block_start": first["unit_id"],
+        "text_block_end": last["unit_id"] + 1,
+        "source_cfi": source_cfi,
+        "resolved_position": {
+            key: resolved_position.get(key)
+            for key in ("spine_index", "href", "local_char_offset", "resolver", "spine_text_len", "text_preview")
+            if key in resolved_position
+        },
+        "selection_method": selection_method,
+        "word_count": sum(int(unit.get("word_count") or 0) for unit in selected),
+        "excerpt": excerpt,
+        "excerpt_hash": "sha256:" + hashlib.sha256(excerpt.encode("utf-8")).hexdigest(),
+        "boundary_in": _boundary_evidence(spine_blocks, start_pos - 1, "previous_text_block"),
+        "boundary_out": _boundary_evidence(spine_blocks, end_pos + 1, "next_text_block"),
+    }
+
+
+def _blocks_by_spine_href(blocks: list[dict[str, Any]]) -> list[list[dict[str, Any]]]:
+    groups: list[list[dict[str, Any]]] = []
+    for unit in blocks:
+        if not groups:
+            groups.append([unit])
+            continue
+        previous = groups[-1][-1]
+        if unit.get("spine_index") == previous.get("spine_index") and unit.get("href") == previous.get("href"):
+            groups[-1].append(unit)
+        else:
+            groups.append([unit])
+    return groups
+
+
+def _batch_ranges_for_spine(
+    spine_blocks: list[dict[str, Any]],
+    *,
+    target_words: int,
+    min_words: int,
+    max_words: int,
+) -> list[tuple[int, int]]:
+    ranges: list[tuple[int, int]] = []
+    current_start: int | None = None
+    current_words = 0
+
+    for idx, unit in enumerate(spine_blocks):
+        unit_words = int(unit.get("word_count") or 0)
+        if current_start is not None and current_words >= min_words and current_words + unit_words > max_words:
+            ranges.append((current_start, idx - 1))
+            current_start = idx
+            current_words = unit_words
+        else:
+            if current_start is None:
+                current_start = idx
+            current_words += unit_words
+
+        if current_words >= target_words:
+            ranges.append((current_start, idx))
+            current_start = None
+            current_words = 0
+
+    if current_start is not None:
+        tail = (current_start, len(spine_blocks) - 1)
+        if ranges:
+            prev_start, prev_end = ranges[-1]
+            prev_words = _range_word_count(spine_blocks, prev_start, prev_end)
+            tail_words = _range_word_count(spine_blocks, tail[0], tail[1])
+            if tail_words < min_words and prev_words + tail_words <= max_words:
+                ranges[-1] = (prev_start, tail[1])
+            else:
+                ranges.append(tail)
+        else:
+            ranges.append(tail)
+    return ranges
+
+
+def _range_word_count(spine_blocks: list[dict[str, Any]], start_pos: int, end_pos: int) -> int:
+    return sum(int(unit.get("word_count") or 0) for unit in spine_blocks[start_pos : end_pos + 1])
 
 
 def _find_focus_index(spine_blocks: list[dict[str, Any]], local_char_offset: int) -> int:

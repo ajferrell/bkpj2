@@ -42,6 +42,7 @@ from src.cfi_fixtures import (
 )
 from src.query_export import (
     append_query_record,
+    build_batch_query_spans,
     build_query_record,
     build_query_span,
     drift_warnings_for_export,
@@ -383,6 +384,53 @@ def cmd_export_query(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_export_batch_spans(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    timeline = load_timeline_with_sidecars(args.data_dir, book["calibre_book_id"])
+    warnings = drift_warnings_for_export(book, timeline)
+    for warning in warnings:
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    text_blocks = load_text_blocks_for_export(args.data_dir, book, timeline=timeline)
+    spans = build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=text_blocks,
+        spine_index=args.spine_index,
+        href=args.href,
+        target_words=args.target_words,
+        min_words=args.min_words,
+        max_words=args.max_words,
+        max_spans=args.max_spans,
+    )
+    output = Path(args.output) if args.output else query_records_path(args.data_dir, book["calibre_book_id"])
+
+    for span in spans:
+        record = build_query_record(
+            book=book,
+            timeline=timeline,
+            span=span,
+            query_text=args.placeholder_query_text or "",
+            query_mode="needs_query",
+            generation_method="batch_placeholder_v1",
+            review_status="needs_query",
+            allow_empty_query=True,
+        )
+        append_query_record(output, record)
+
+    print(f"Exported batch query span records: {len(spans)}")
+    print(f"Output: {output}")
+    if spans:
+        first = spans[0]
+        last = spans[-1]
+        print(
+            "Blocks: "
+            f"{first['text_block_start']}-{first['text_block_end']} "
+            f"through {last['text_block_start']}-{last['text_block_end']}"
+        )
+    return 0
+
+
 def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
     return {"cfi": epubcfi, "probe_skipped": True}
 
@@ -637,6 +685,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
     p.add_argument("--review-status", default="unreviewed", help="Initial review status stored in the record")
     p.set_defaults(func=cmd_export_query)
+
+    p = sub.add_parser("export-batch-spans", help="Export deterministic query-span candidates for a prepared book")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--spine-index", type=int, help="Only export spans from one prepared spine index")
+    p.add_argument("--href", help="Only export spans from one prepared spine href/chapter")
+    p.add_argument("--max-spans", type=int, help="Maximum number of span records to write")
+    p.add_argument("--output", help="JSONL output path; defaults to the prepared book data directory")
+    p.add_argument("--target-words", type=int, default=800, help="Preferred query span size")
+    p.add_argument("--min-words", type=int, default=500, help="Minimum query span size before stopping at max")
+    p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
+    p.add_argument("--placeholder-query-text", default="", help="Optional placeholder query text for each record")
+    p.set_defaults(func=cmd_export_batch_spans)
 
     return parser
 
