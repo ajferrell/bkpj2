@@ -370,7 +370,6 @@ def cmd_export_query(args: argparse.Namespace) -> int:
         timeline=timeline,
         span=span,
         query_text=query_text,
-        negative_text=args.negative_text or "",
         review_status=args.review_status,
     )
     output = Path(args.output) if args.output else query_records_path(args.data_dir, book["calibre_book_id"])
@@ -678,12 +677,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--source-cfi", help="Optional source CFI to store with a manual resolved coordinate")
     p.add_argument("--query-text", help="Manual compact audio-intent query text")
     p.add_argument("--query-file", help="File containing manual compact audio-intent query text")
-    p.add_argument("--negative-text", default="", help="Optional negative query text")
     p.add_argument("--output", help="JSONL output path; defaults to the prepared book data directory")
     p.add_argument("--target-words", type=int, default=800, help="Preferred query span size")
     p.add_argument("--min-words", type=int, default=500, help="Minimum query span size before stopping at max")
     p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
-    p.add_argument("--review-status", default="unreviewed", help="Initial review status stored in the record")
+    p.add_argument(
+        "--review-status",
+        default="unreviewed",
+        choices=["unreviewed", "approved", "rejected"],
+        help="Initial review status stored in the record",
+    )
     p.set_defaults(func=cmd_export_query)
 
     p = sub.add_parser("export-batch-spans", help="Export deterministic query-span candidates for a prepared book")

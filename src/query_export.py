@@ -20,6 +20,19 @@ from .anchors import (
 QUERY_RECORD_SCHEMA_VERSION = 1
 DEFAULT_RETRIEVAL_PROFILE = "local_audio_text_query"
 DEFAULT_EXCERPT_CHAR_LIMIT = 2200
+ALLOWED_QUERY_MODES = {"manual", "generated", "needs_query"}
+ALLOWED_REVIEW_STATUSES = {"needs_query", "unreviewed", "approved", "rejected"}
+FORBIDDEN_QUERY_RECORD_KEYS = {
+    "candidate_rankings",
+    "candidates",
+    "playback",
+    "playback_policy",
+    "retrieval_candidates",
+    "retrieval_results",
+    "runtime",
+    "selected_asset",
+    "selected_assets",
+}
 
 SpineExtractor = Callable[[str | Path], list[dict[str, Any]]]
 
@@ -210,12 +223,20 @@ def build_query_record(
     timeline: dict[str, Any],
     span: dict[str, Any],
     query_text: str,
-    negative_text: str = "",
     query_mode: str = "manual",
     generation_method: str = "manual_v1",
     review_status: str = "unreviewed",
     allow_empty_query: bool = False,
 ) -> dict[str, Any]:
+    if query_mode not in ALLOWED_QUERY_MODES:
+        raise ValueError(f"Unsupported query mode: {query_mode}")
+    if review_status not in ALLOWED_REVIEW_STATUSES:
+        raise ValueError(f"Unsupported review status: {review_status}")
+    if query_mode == "needs_query" and review_status != "needs_query":
+        raise ValueError("needs_query records must use review_status=needs_query")
+    if review_status == "needs_query" and query_mode != "needs_query":
+        raise ValueError("review_status=needs_query requires query_mode=needs_query")
+
     query = query_text.strip()
     if not query and not allow_empty_query:
         raise ValueError("Manual query text cannot be empty")
@@ -239,10 +260,9 @@ def build_query_record(
         "query": {
             "mode": query_mode,
             "text": query,
-            "negative_text": negative_text.strip(),
             "generation_method": generation_method,
             "model": None,
-            "source": "span_excerpt",
+            "source": _query_source(query_mode),
         },
         "handoff": {
             "target": "music-retrieval-lab",
@@ -281,10 +301,22 @@ def validate_query_record(record: dict[str, Any]) -> list[str]:
             errors.append(f"missing_span_{key}")
     query = record.get("query") or {}
     review = record.get("review") or {}
-    if not (query.get("text") or "").strip() and review.get("status") != "needs_query":
+    query_mode = query.get("mode")
+    review_status = review.get("status")
+    if query_mode not in ALLOWED_QUERY_MODES:
+        errors.append("query_mode_invalid")
+    if review_status not in ALLOWED_REVIEW_STATUSES:
+        errors.append("review_status_invalid")
+    if query_mode == "needs_query" and review_status != "needs_query":
+        errors.append("needs_query_review_status_invalid")
+    if review_status == "needs_query" and query_mode != "needs_query":
+        errors.append("needs_query_mode_invalid")
+    if not (query.get("text") or "").strip() and (query_mode != "needs_query" or review_status != "needs_query"):
         errors.append("query_text_empty")
     if record.get("handoff", {}).get("target") != "music-retrieval-lab":
         errors.append("handoff_target_invalid")
+    for path in _forbidden_contract_paths(record):
+        errors.append(f"forbidden_query_record_field:{path}")
     return errors
 
 
@@ -491,6 +523,29 @@ def _cap_text(text: str, limit: int) -> str:
     if len(compact) <= limit:
         return compact
     return compact[:limit].rstrip() + "..."
+
+
+def _query_source(query_mode: str) -> str:
+    if query_mode == "manual":
+        return "user"
+    return "span_excerpt"
+
+
+def _forbidden_contract_paths(value: Any, path: str = "$") -> list[str]:
+    if isinstance(value, dict):
+        found: list[str] = []
+        for key, child in value.items():
+            child_path = f"{path}.{key}"
+            if key in FORBIDDEN_QUERY_RECORD_KEYS:
+                found.append(child_path)
+            found.extend(_forbidden_contract_paths(child, child_path))
+        return found
+    if isinstance(value, list):
+        found = []
+        for idx, child in enumerate(value):
+            found.extend(_forbidden_contract_paths(child, f"{path}[{idx}]"))
+        return found
+    return []
 
 
 def _boundary_evidence(spine_blocks: list[dict[str, Any]], idx: int, kind: str) -> dict[str, Any] | None:

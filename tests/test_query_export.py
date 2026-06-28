@@ -148,20 +148,49 @@ def test_query_record_is_schema_valid_and_stable(tmp_path):
         timeline=timeline,
         span=span,
         query_text="dark quiet instrumental suspense; low strings; no vocals",
-        negative_text="lyrics, comedy",
     )
     again = build_query_record(
         book=book,
         timeline=timeline,
         span=span,
         query_text="dark quiet instrumental suspense; low strings; no vocals",
-        negative_text="lyrics, comedy",
     )
 
     assert validate_query_record(record) == []
     assert record == again
     assert record["handoff"]["target"] == "music-retrieval-lab"
     assert record["query"]["generation_method"] == "manual_v1"
+    assert record["query"]["source"] == "user"
+
+
+def test_query_record_rejects_out_of_contract_review_state_and_fields(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    span = build_query_span(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        spine_index=0,
+        local_char_offset=10,
+        target_words=12,
+        min_words=8,
+        max_words=20,
+    )
+    record = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=span,
+        query_text="dark quiet instrumental suspense; low strings; no vocals",
+    )
+    record["review"]["status"] = "selected"
+    record["retrieval_results"] = {"candidates": [{"asset_id": "asset-1"}]}
+
+    errors = validate_query_record(record)
+
+    assert "review_status_invalid" in errors
+    assert "forbidden_query_record_field:$.retrieval_results" in errors
+    assert "forbidden_query_record_field:$.retrieval_results.candidates" in errors
 
 
 def test_batch_query_spans_cover_blocks_without_overlap(tmp_path):

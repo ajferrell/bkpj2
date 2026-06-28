@@ -119,7 +119,9 @@ Main local artifacts:
   sidecar written only with `prepare-book --debug-text`.
 - `data/books/<calibre_book_id>/query_records.jsonl`: query handoff records
   containing book identity, text-block span provenance, capped excerpt, query
-  text or `needs_query` placeholders, handoff target, and review status.
+  text or `needs_query` placeholders, handoff target, and review status. These
+  records do not store retrieval candidates, candidate rankings, selected
+  assets, runtime state, or playback policy.
 - Planned `data/books/<calibre_book_id>/retrieval_runs/...`: retrieval-run
   records with package pointers, candidate strategy, top candidate per span,
   and `music-retrieval-lab` package outputs such as `retrieval_results.jsonl`
