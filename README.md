@@ -4,8 +4,15 @@ bkpj2 is the book-to-audio-query side of a local reading-audio workflow.
 
 The current code imports a Calibre library, reads live Calibre E-book Viewer
 positions, resolves EPUB CFIs through Calibre helpers, prepares text-block
-timelines, inspects how a live CFI maps back to book text, and exports compact
-manual audio-intent query records for review or downstream local retrieval.
+timelines, inspects how a live CFI maps back to book text, exports compact
+manual audio-intent query records, and exports deterministic span placeholders
+for later query authoring.
+
+Retrieval, embedding indexes, candidate ranking, review HTML, and playback are
+owned by `music-retrieval-lab` or later artifacts. bkpj2's near-term role is to
+produce book/span/query provenance, invoke the lab as an external command, and
+store retrieval-run records that point to lab packages and materialize the top
+candidate per span by default.
 
 ## Setup
 
@@ -69,6 +76,13 @@ Export deterministic query-span candidates for manual query authoring:
 .\.venv\Scripts\python.exe main.py export-batch-spans "Book Title" --target-words 800 --max-spans 20
 ```
 
+Planned next commands:
+
+```powershell
+.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider local-model --prompt-version audio_intent_v1
+.\.venv\Scripts\python.exe main.py retrieve-audio --query-records .\query_records.generated.jsonl --retrieval-profile local_fused_v1 --lab-project C:\dev\music-retrieval-lab --candidate-strategy top_ranked --out .\data\books\5\retrieval_runs\run_001
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -106,6 +120,10 @@ Main local artifacts:
 - `data/books/<calibre_book_id>/query_records.jsonl`: query handoff records
   containing book identity, text-block span provenance, capped excerpt, query
   text or `needs_query` placeholders, handoff target, and review status.
+- Planned `data/books/<calibre_book_id>/retrieval_runs/...`: retrieval-run
+  records with package pointers, candidate strategy, top candidate per span,
+  and `music-retrieval-lab` package outputs such as `retrieval_results.jsonl`
+  and `retrieval_summary.json`.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
 The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The
