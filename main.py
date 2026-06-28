@@ -41,8 +41,11 @@ from src.cfi_fixtures import (
     timestamp_name,
 )
 from src.query_export import (
+    FakeQueryGenerator,
+    LocalCommandQueryGenerator,
     append_query_record,
     build_batch_query_spans,
+    generate_query_records,
     build_query_record,
     build_query_span,
     drift_warnings_for_export,
@@ -430,6 +433,32 @@ def cmd_export_batch_spans(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_generate_queries(args: argparse.Namespace) -> int:
+    generator = _query_generator_from_args(args)
+    output = Path(args.out) if args.out else _default_generated_output(args.input)
+    summary = generate_query_records(
+        input_path=args.input,
+        output_path=output,
+        generator=generator,
+        prompt_version=args.prompt_version,
+        generation_method=args.generation_method,
+        cache_path=args.cache,
+        errors_path=args.errors,
+        overwrite=args.overwrite,
+        limit=args.limit,
+    )
+
+    print(f"Generated query records: {summary['generated_count']}")
+    print(f"Cache hits: {summary['cached_count']}")
+    print(f"Failures: {summary['failed_count']}")
+    print(f"Output: {summary['output_path']}")
+    print(f"Cache: {summary['cache_path']}")
+    if summary["failed_count"]:
+        print(f"Errors: {summary['errors_path']}", file=sys.stderr)
+        return 1
+    return 0
+
+
 def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
     return {"cfi": epubcfi, "probe_skipped": True}
 
@@ -442,6 +471,33 @@ def _read_query_text(args: argparse.Namespace) -> str:
     if args.query_text:
         return args.query_text.strip()
     raise ValueError("Provide manual query text with --query-text or --query-file")
+
+
+def _query_generator_from_args(args: argparse.Namespace) -> FakeQueryGenerator | LocalCommandQueryGenerator:
+    if args.provider == "fake":
+        if args.model:
+            generator = FakeQueryGenerator()
+            generator.model_id = args.model
+            return generator
+        return FakeQueryGenerator()
+    if args.provider == "local-command":
+        if not args.command:
+            raise ValueError("--command is required when --provider local-command")
+        return LocalCommandQueryGenerator(
+            command=args.command,
+            args=args.command_arg,
+            model_id=args.model,
+        )
+    raise ValueError(f"Unsupported query generator provider: {args.provider}")
+
+
+def _default_generated_output(input_path: str | Path) -> Path:
+    path = Path(input_path)
+    if path.name == "query_records.jsonl":
+        return path.with_name("query_records.generated.jsonl")
+    if path.name == "query_records.needs_query.jsonl":
+        return path.with_name("query_records.generated.jsonl")
+    return path.with_suffix(path.suffix + ".generated.jsonl")
 
 
 def _href_for_spine(timeline: dict[str, Any], spine_index: int) -> str | None:
@@ -700,6 +756,26 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
     p.add_argument("--placeholder-query-text", default="", help="Optional placeholder query text for each record")
     p.set_defaults(func=cmd_export_batch_spans)
+
+    p = sub.add_parser("generate-queries", help="Generate audio-intent query records from needs_query records")
+    p.add_argument("--input", required=True, help="Input JSONL with needs_query span records")
+    p.add_argument("--out", help="Generated JSONL output path")
+    p.add_argument(
+        "--provider",
+        choices=["fake", "local-command"],
+        default="local-command",
+        help="Generation adapter to use",
+    )
+    p.add_argument("--command", help="Local command executable; reads prompt on stdin and writes query text")
+    p.add_argument("--command-arg", action="append", default=[], help="Argument passed to --command")
+    p.add_argument("--model", help="Model/provider id to store in generated query records")
+    p.add_argument("--prompt-version", default="audio_intent_v1")
+    p.add_argument("--generation-method", default="local_model_audio_intent_v1")
+    p.add_argument("--cache", help="Generation cache JSON path")
+    p.add_argument("--errors", help="Generation error JSONL sidecar path")
+    p.add_argument("--overwrite", action="store_true", help="Overwrite the generated output if it exists")
+    p.add_argument("--limit", type=int, help="Maximum number of needs_query records to process")
+    p.set_defaults(func=cmd_generate_queries)
 
     return parser
 

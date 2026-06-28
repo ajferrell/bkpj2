@@ -1,11 +1,13 @@
-"""Manual query JSONL export from prepared book text blocks."""
+"""Query JSONL export from prepared book text blocks."""
 
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
+import subprocess
 from pathlib import Path
-from typing import Any, Callable
+from typing import Any, Callable, Protocol
 
 from .anchors import (
     extract_source_units,
@@ -37,8 +39,71 @@ FORBIDDEN_QUERY_RECORD_KEYS = {
 SpineExtractor = Callable[[str | Path], list[dict[str, Any]]]
 
 
+class QueryGenerator(Protocol):
+    provider: str
+    model_id: str
+
+    def generate(self, record: dict[str, Any], prompt: str) -> str:
+        """Generate compact audio-intent query text for one source record."""
+
+
+class FakeQueryGenerator:
+    """Deterministic generator used for tests and local smoke runs."""
+
+    provider = "fake"
+    model_id = "fake-audio-intent-v1"
+
+    def generate(self, record: dict[str, Any], prompt: str) -> str:
+        excerpt = (record.get("span") or {}).get("excerpt") or ""
+        words = [
+            word.strip(".,;:!?()[]{}\"'").casefold()
+            for word in excerpt.split()
+        ]
+        useful = [word for word in words if len(word) >= 4]
+        chosen = []
+        for word in useful:
+            if word not in chosen:
+                chosen.append(word)
+            if len(chosen) == 6:
+                break
+        if not chosen:
+            chosen = ["quiet", "instrumental", "underscore"]
+        return "; ".join(["instrumental audio intent", " ".join(chosen), "no vocals"])
+
+
+class LocalCommandQueryGenerator:
+    """Adapter for a local command that reads a prompt on stdin and prints one query."""
+
+    provider = "local-command"
+
+    def __init__(self, command: str, args: list[str] | None = None, model_id: str | None = None) -> None:
+        self.command = command
+        self.args = list(args or [])
+        self.model_id = model_id or Path(command).name
+
+    def generate(self, record: dict[str, Any], prompt: str) -> str:
+        result = subprocess.run(
+            [self.command, *self.args],
+            input=prompt,
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        if result.returncode != 0:
+            stderr = result.stderr.strip()
+            raise RuntimeError(stderr or f"local command exited with status {result.returncode}")
+        query_text = result.stdout.strip()
+        if not query_text:
+            raise RuntimeError("local command produced empty query text")
+        return query_text
+
+
 def query_records_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
     return Path(data_dir) / "books" / str(calibre_book_id) / "query_records.jsonl"
+
+
+def default_generated_query_records_path(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return Path(data_dir) / "books" / str(calibre_book_id) / "query_records.generated.jsonl"
 
 
 def load_text_blocks_for_export(
@@ -273,6 +338,162 @@ def build_query_record(
             "status": review_status,
             "notes": "",
         },
+    }
+
+
+def build_generated_query_record(
+    *,
+    source_record: dict[str, Any],
+    query_text: str,
+    generation_method: str,
+    model: str,
+    prompt_version: str,
+    provider: str,
+) -> dict[str, Any]:
+    query = query_text.strip()
+    if not query:
+        raise ValueError("Generated query text cannot be empty")
+    source_errors = validate_query_record(source_record)
+    if source_errors:
+        raise ValueError(f"Invalid source query record: {', '.join(source_errors)}")
+    if source_record.get("query", {}).get("mode") != "needs_query":
+        raise ValueError("Generated queries can only be built from needs_query records")
+
+    record = copy.deepcopy(source_record)
+    book_id = record.get("book", {}).get("calibre_book_id")
+    span = record.get("span") or {}
+    query_hash = hashlib.sha256(query.encode("utf-8")).hexdigest()[:12]
+    record["record_id"] = f"book-{book_id}-{span['span_id']}-q-{query_hash}"
+    record["query"] = {
+        "mode": "generated",
+        "text": query,
+        "generation_method": generation_method,
+        "model": model,
+        "source": "span_excerpt",
+        "provider": provider,
+        "prompt_version": prompt_version,
+        "input_excerpt_hash": span.get("excerpt_hash"),
+    }
+    record["review"] = {
+        "status": "unreviewed",
+        "notes": "",
+    }
+    return record
+
+
+def read_query_records(path: str | Path) -> list[dict[str, Any]]:
+    records: list[dict[str, Any]] = []
+    with open(path, "r", encoding="utf-8") as f:
+        for line_number, line in enumerate(f, start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            try:
+                records.append(json.loads(stripped))
+            except json.JSONDecodeError as exc:
+                raise ValueError(f"Invalid JSONL at line {line_number}: {exc}") from exc
+    return records
+
+
+def build_generation_prompt(record: dict[str, Any], prompt_version: str) -> str:
+    span = record.get("span") or {}
+    book = record.get("book") or {}
+    return "\n".join(
+        [
+            f"Prompt version: {prompt_version}",
+            "Write one compact music retrieval query for the excerpt.",
+            "Focus on mood, instrumentation, energy, tempo, and vocal policy.",
+            "Return only the query text.",
+            f"Book: {book.get('title') or ''}",
+            f"Span id: {span.get('span_id') or ''}",
+            f"Excerpt hash: {span.get('excerpt_hash') or ''}",
+            "",
+            "Excerpt:",
+            span.get("excerpt") or "",
+        ]
+    )
+
+
+def generate_query_records(
+    *,
+    input_path: str | Path,
+    output_path: str | Path,
+    generator: QueryGenerator,
+    prompt_version: str,
+    generation_method: str = "local_model_audio_intent_v1",
+    cache_path: str | Path | None = None,
+    errors_path: str | Path | None = None,
+    overwrite: bool = False,
+    limit: int | None = None,
+) -> dict[str, Any]:
+    if limit is not None and limit <= 0:
+        raise ValueError("--limit must be positive")
+
+    output = Path(output_path)
+    if output.exists() and not overwrite:
+        raise ValueError(f"Output already exists: {output}")
+    output.parent.mkdir(parents=True, exist_ok=True)
+    if overwrite:
+        output.write_text("", encoding="utf-8")
+
+    cache_file = Path(cache_path) if cache_path else output.with_suffix(output.suffix + ".cache.json")
+    error_file = Path(errors_path) if errors_path else output.with_suffix(output.suffix + ".errors.jsonl")
+    cache = _read_generation_cache(cache_file)
+    if overwrite and error_file.exists():
+        error_file.write_text("", encoding="utf-8")
+
+    records = read_query_records(input_path)
+    source_records = [record for record in records if record.get("query", {}).get("mode") == "needs_query"]
+    if limit is not None:
+        source_records = source_records[:limit]
+
+    generated = 0
+    cached = 0
+    failed = 0
+    for record in source_records:
+        key = _generation_cache_key(
+            record,
+            prompt_version=prompt_version,
+            model_id=generator.model_id,
+        )
+        try:
+            query_text = cache.get(key)
+            if query_text:
+                cached += 1
+            else:
+                query_text = generator.generate(record, build_generation_prompt(record, prompt_version))
+                cache[key] = query_text
+
+            generated_record = build_generated_query_record(
+                source_record=record,
+                query_text=query_text,
+                generation_method=generation_method,
+                model=generator.model_id,
+                prompt_version=prompt_version,
+                provider=generator.provider,
+            )
+            append_query_record(output, generated_record)
+            generated += 1
+        except Exception as exc:
+            failed += 1
+            _append_generation_error(
+                error_file,
+                record=record,
+                prompt_version=prompt_version,
+                model_id=generator.model_id,
+                error=str(exc),
+            )
+
+    _write_generation_cache(cache_file, cache)
+    return {
+        "input_path": str(input_path),
+        "output_path": str(output),
+        "cache_path": str(cache_file),
+        "errors_path": str(error_file),
+        "source_record_count": len(source_records),
+        "generated_count": generated,
+        "cached_count": cached,
+        "failed_count": failed,
     }
 
 
@@ -529,6 +750,53 @@ def _query_source(query_mode: str) -> str:
     if query_mode == "manual":
         return "user"
     return "span_excerpt"
+
+
+def _read_generation_cache(path: Path) -> dict[str, str]:
+    if not path.exists():
+        return {}
+    with open(path, "r", encoding="utf-8") as f:
+        raw = json.load(f)
+    if not isinstance(raw, dict):
+        raise ValueError(f"Generation cache must be a JSON object: {path}")
+    return {str(key): str(value) for key, value in raw.items()}
+
+
+def _write_generation_cache(path: Path, cache: dict[str, str]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(cache, f, ensure_ascii=False, indent=2, sort_keys=True)
+
+
+def _generation_cache_key(record: dict[str, Any], *, prompt_version: str, model_id: str) -> str:
+    span = record.get("span") or {}
+    basis = {
+        "span_id": span.get("span_id"),
+        "excerpt_hash": span.get("excerpt_hash"),
+        "prompt_version": prompt_version,
+        "model_id": model_id,
+    }
+    return hashlib.sha256(json.dumps(basis, sort_keys=True).encode("utf-8")).hexdigest()
+
+
+def _append_generation_error(
+    path: Path,
+    *,
+    record: dict[str, Any],
+    prompt_version: str,
+    model_id: str,
+    error: str,
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    error_record = {
+        "record_id": record.get("record_id"),
+        "span_id": (record.get("span") or {}).get("span_id"),
+        "prompt_version": prompt_version,
+        "model": model_id,
+        "error": error,
+    }
+    with open(path, "a", encoding="utf-8") as f:
+        f.write(json.dumps(error_record, ensure_ascii=False, sort_keys=True) + "\n")
 
 
 def _forbidden_contract_paths(value: Any, path: str = "$") -> list[str]:

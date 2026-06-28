@@ -9,10 +9,14 @@ from src.anchors import (
 )
 from src.calibre_native import save_manifest
 from src.query_export import (
+    FakeQueryGenerator,
+    append_query_record,
     build_batch_query_spans,
+    build_generated_query_record,
     build_query_record,
     build_query_span,
     drift_warnings_for_export,
+    generate_query_records,
     load_text_blocks_for_export,
     query_records_path,
     validate_query_record,
@@ -251,6 +255,147 @@ def test_empty_needs_query_record_is_schema_valid(tmp_path):
     assert record["review"]["status"] == "needs_query"
 
 
+def test_generated_query_record_preserves_span_and_adds_generation_metadata(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=build_batch_query_spans(
+            book=book,
+            timeline=timeline,
+            text_blocks=blocks,
+            max_spans=1,
+            target_words=14,
+            min_words=8,
+            max_words=20,
+        )[0],
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+
+    record = build_generated_query_record(
+        source_record=source,
+        query_text="quiet ominous instrumental suspense; low strings; no vocals",
+        generation_method="local_model_audio_intent_v1",
+        model="fake-audio-intent-v1",
+        prompt_version="audio_intent_v1",
+        provider="fake",
+    )
+
+    assert validate_query_record(record) == []
+    assert record["span"] == source["span"]
+    assert record["query"]["mode"] == "generated"
+    assert record["query"]["model"] == "fake-audio-intent-v1"
+    assert record["query"]["provider"] == "fake"
+    assert record["query"]["prompt_version"] == "audio_intent_v1"
+    assert record["query"]["input_excerpt_hash"] == source["span"]["excerpt_hash"]
+    assert record["review"]["status"] == "unreviewed"
+    assert source["query"]["mode"] == "needs_query"
+
+
+def test_generate_queries_writes_generated_records_and_cache(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    input_path = tmp_path / "query_records.needs_query.jsonl"
+    output = tmp_path / "query_records.generated.jsonl"
+    span = build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        max_spans=1,
+        target_words=14,
+        min_words=8,
+        max_words=20,
+    )[0]
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=span,
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+    append_query_record(input_path, source)
+
+    summary = generate_query_records(
+        input_path=input_path,
+        output_path=output,
+        generator=FakeQueryGenerator(),
+        prompt_version="audio_intent_v1",
+        overwrite=True,
+    )
+
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert summary["generated_count"] == 1
+    assert summary["failed_count"] == 0
+    assert len(records) == 1
+    assert records[0]["query"]["mode"] == "generated"
+    assert records[0]["query"]["source"] == "span_excerpt"
+    assert records[0]["query"]["model"] == "fake-audio-intent-v1"
+    assert "instrumental audio intent" in records[0]["query"]["text"]
+    assert (tmp_path / "query_records.generated.jsonl.cache.json").exists()
+
+
+def test_generate_queries_records_failures_in_sidecar(tmp_path):
+    class FailingGenerator:
+        provider = "fake"
+        model_id = "failing-model"
+
+        def generate(self, record, prompt):
+            raise RuntimeError("model unavailable")
+
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    input_path = tmp_path / "query_records.needs_query.jsonl"
+    output = tmp_path / "query_records.generated.jsonl"
+    errors = tmp_path / "query_records.generated.errors.jsonl"
+    span = build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        max_spans=1,
+        target_words=14,
+        min_words=8,
+        max_words=20,
+    )[0]
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=span,
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+    append_query_record(input_path, source)
+
+    summary = generate_query_records(
+        input_path=input_path,
+        output_path=output,
+        generator=FailingGenerator(),
+        prompt_version="audio_intent_v1",
+        errors_path=errors,
+        overwrite=True,
+    )
+
+    error_record = json.loads(errors.read_text(encoding="utf-8").strip())
+    assert summary["generated_count"] == 0
+    assert summary["failed_count"] == 1
+    assert output.read_text(encoding="utf-8") == ""
+    assert error_record["record_id"] == source["record_id"]
+    assert error_record["error"] == "model unavailable"
+
+
 def test_drift_warnings_are_exposed_for_export(tmp_path):
     book, data_dir = prepare_fake_book(tmp_path)
     timeline = load_timeline(data_dir, book["calibre_book_id"])
@@ -346,3 +491,57 @@ def test_export_batch_spans_cli_writes_needs_query_records(tmp_path, capsys):
     assert records[0]["span"]["selection_method"] == "batch_text_blocks_v1"
     captured = capsys.readouterr()
     assert "Exported batch query span records: 2" in captured.out
+
+
+def test_generate_queries_cli_writes_generated_records(tmp_path, capsys):
+    book, data_dir = prepare_fake_book(tmp_path)
+    manifest = {
+        "libraries": [str(tmp_path)],
+        "books": [book],
+    }
+    save_manifest(manifest, data_dir=data_dir)
+    input_path = tmp_path / "batch_queries.jsonl"
+    output = tmp_path / "generated_queries.jsonl"
+    parser = build_parser()
+    batch_args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "export-batch-spans",
+            "42",
+            "--target-words",
+            "14",
+            "--min-words",
+            "8",
+            "--max-words",
+            "20",
+            "--max-spans",
+            "1",
+            "--output",
+            str(input_path),
+        ]
+    )
+    assert batch_args.func(batch_args) == 0
+
+    args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "generate-queries",
+            "--input",
+            str(input_path),
+            "--out",
+            str(output),
+            "--provider",
+            "fake",
+        ]
+    )
+
+    assert args.func(args) == 0
+
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["query"]["mode"] == "generated"
+    assert records[0]["review"]["status"] == "unreviewed"
+    captured = capsys.readouterr()
+    assert "Generated query records: 1" in captured.out
