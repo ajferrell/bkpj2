@@ -52,6 +52,7 @@ from src.query_export import (
     load_text_blocks_for_export,
     query_records_path,
 )
+from src.retrieval_run import run_retrieval_audio
 
 
 def cmd_import_calibre(args: argparse.Namespace) -> int:
@@ -459,6 +460,47 @@ def cmd_generate_queries(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_retrieve_audio(args: argparse.Namespace) -> int:
+    record = run_retrieval_audio(
+        query_records_path=args.query_records,
+        retrieval_profile=args.retrieval_profile,
+        profile_config_path=args.profile_config,
+        output_dir=args.out,
+        lab_project=args.lab_project,
+        lab_executable=args.lab_executable,
+        lab_python=args.lab_python,
+        mode=args.mode,
+        limit=args.limit,
+        candidate_strategy=args.candidate_strategy,
+        run_record_path=args.run_record,
+    )
+
+    print(f"Retrieval run record: {record['retrieval_run_record_path']}")
+    print(f"Exit status: {record['exit_status']}")
+    print(f"Stdout: {record['stdout_path']}")
+    print(f"Stderr: {record['stderr_path']}")
+    print(f"Results: {record['retrieval_package_path']}")
+    print(f"Summary: {record['retrieval_summary_path']}")
+    print(f"Top candidates: {len(record['top_candidates'])}")
+    if args.verbose:
+        _print_retrieval_verbose(record)
+    return int(record["exit_status"])
+
+
+def _print_retrieval_verbose(record: dict[str, Any]) -> None:
+    print("\nLab command:")
+    print(record["lab_command"])
+    _print_file_section("Lab stdout", record["stdout_path"])
+    _print_file_section("Lab stderr", record["stderr_path"])
+
+
+def _print_file_section(title: str, path_value: str) -> None:
+    path = Path(path_value)
+    text = path.read_text(encoding="utf-8") if path.exists() else ""
+    print(f"\n{title}:")
+    print(text.rstrip() if text.strip() else "(empty)")
+
+
 def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
     return {"cfi": epubcfi, "probe_skipped": True}
 
@@ -776,6 +818,31 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--overwrite", action="store_true", help="Overwrite the generated output if it exists")
     p.add_argument("--limit", type=int, help="Maximum number of needs_query records to process")
     p.set_defaults(func=cmd_generate_queries)
+
+    p = sub.add_parser("retrieve-audio", help="Run music-retrieval-lab retrieval for query records")
+    p.add_argument("--query-records", required=True, help="Generated or manual query-record JSONL input")
+    p.add_argument("--retrieval-profile", required=True, help="Lab retrieval profile name")
+    p.add_argument("--profile-config", help="Lab retrieval profile YAML path")
+    p.add_argument("--out", required=True, help="Output directory for the lab package and retrieval-run record")
+    p.add_argument("--lab-project", help="music-retrieval-lab checkout to use as the subprocess working directory")
+    p.add_argument("--lab-executable", default="music-lab", help="music-lab executable to run")
+    p.add_argument("--lab-python", help="Python executable for `-m music_retrieval_lab.cli`")
+    p.add_argument(
+        "--mode",
+        choices=["package-only", "review-html"],
+        default="package-only",
+        help="Lab output mode",
+    )
+    p.add_argument("--limit", type=int, help="Review HTML row limit when --mode review-html is used")
+    p.add_argument(
+        "--candidate-strategy",
+        choices=["top_ranked"],
+        default="top_ranked",
+        help="How bkpj2 materializes candidates from the lab package",
+    )
+    p.add_argument("--run-record", help="Retrieval-run JSON path; defaults to <out>/retrieval_run.json")
+    p.add_argument("--verbose", action="store_true", help="Print captured lab command, stdout, and stderr")
+    p.set_defaults(func=cmd_retrieve_audio)
 
     return parser
 

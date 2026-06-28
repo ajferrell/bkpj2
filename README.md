@@ -5,9 +5,9 @@ bkpj2 is the book-to-audio-query side of a local reading-audio workflow.
 The current code imports a Calibre library, reads live Calibre E-book Viewer
 positions, resolves EPUB CFIs through Calibre helpers, prepares text-block
 timelines, inspects how a live CFI maps back to book text, exports compact
-manual audio-intent query records, and exports deterministic span placeholders
-for later query authoring, and generates local audio-intent query records from
-those placeholders.
+manual audio-intent query records, exports deterministic span placeholders for
+later query authoring, generates local audio-intent query records from those
+placeholders, and shells out to `music-retrieval-lab` for retrieval packages.
 
 Retrieval, embedding indexes, candidate ranking, review HTML, and playback are
 owned by `music-retrieval-lab` or later artifacts. bkpj2's near-term role is to
@@ -84,10 +84,11 @@ Generate local audio-intent query records from `needs_query` placeholders:
 .\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider fake
 ```
 
-Planned next command:
+Run a lab retrieval package and write a bkpj2 retrieval-run pointer:
 
 ```powershell
-.\.venv\Scripts\python.exe main.py retrieve-audio --query-records .\query_records.generated.jsonl --retrieval-profile local_fused_v1 --lab-project C:\dev\music-retrieval-lab --candidate-strategy top_ranked --out .\data\books\5\retrieval_runs\run_001
+.\.venv\Scripts\python.exe main.py retrieve-audio --query-records .\query_records.generated.jsonl --retrieval-profile local_fused_v1 --profile-config C:\dev\music-retrieval-lab\configs\retrieval_profile.yml --lab-project C:\dev\music-retrieval-lab --lab-python C:\dev\music-retrieval-lab\.venv\Scripts\python.exe --candidate-strategy top_ranked --out .\data\books\5\retrieval_runs\run_001
+.\.venv\Scripts\python.exe main.py retrieve-audio --query-records .\query_records.generated.jsonl --retrieval-profile local_fused_v1 --profile-config C:\dev\music-retrieval-lab\configs\retrieval_profile.yml --lab-project C:\dev\music-retrieval-lab --lab-python C:\dev\music-retrieval-lab\.venv\Scripts\python.exe --candidate-strategy top_ranked --out .\data\books\5\retrieval_runs\run_002 --verbose
 ```
 
 Capture or check CFI fixtures:
@@ -132,10 +133,10 @@ Main local artifacts:
 - `query_records.generated.jsonl`: generated query records written from
   `needs_query` inputs. Generation cache and failure sidecars are written next
   to the output unless explicit paths are provided.
-- Planned `data/books/<calibre_book_id>/retrieval_runs/...`: retrieval-run
-  records with package pointers, candidate strategy, top candidate per span,
-  and `music-retrieval-lab` package outputs such as `retrieval_results.jsonl`
-  and `retrieval_summary.json`.
+- `data/books/<calibre_book_id>/retrieval_runs/...`: retrieval-run records
+  with package pointers, captured lab stdout/stderr, candidate strategy, top
+  candidate per span, and `music-retrieval-lab` package outputs such as
+  `retrieval_results.jsonl` and `retrieval_summary.json`.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
 The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The
