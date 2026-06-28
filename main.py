@@ -52,7 +52,11 @@ from src.query_export import (
     load_text_blocks_for_export,
     query_records_path,
 )
-from src.retrieval_run import run_retrieval_audio
+from src.retrieval_run import (
+    retrieval_runs_dir,
+    run_retrieval_audio,
+    write_retrieval_run_index,
+)
 
 
 def cmd_import_calibre(args: argparse.Namespace) -> int:
@@ -487,6 +491,51 @@ def cmd_retrieve_audio(args: argparse.Namespace) -> int:
     return int(record["exit_status"])
 
 
+def cmd_list_retrieval_runs(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    runs_dir = retrieval_runs_dir(args.data_dir, book["calibre_book_id"])
+    index = write_retrieval_run_index(runs_dir, calibre_book_id=book["calibre_book_id"])
+    if args.json:
+        print(json.dumps(index, indent=2, ensure_ascii=False))
+        return 0
+
+    authors = ", ".join(book.get("authors") or []) or "Unknown author"
+    print(f"Retrieval runs for: {book.get('title')} - {authors}")
+    print(f"Runs dir: {runs_dir}")
+    print(f"Index: {index['retrieval_run_index_path']}")
+    runs = index.get("runs", [])
+    if not runs:
+        print("No retrieval runs found.")
+        return 0
+
+    for run in runs:
+        coverage = run.get("top_candidate_coverage") or {}
+        missing = run.get("missing_files") or []
+        print(
+            f"{run.get('run_id')} | exit={run.get('exit_status')} | "
+            f"profile={run.get('retrieval_profile')} | created={run.get('created_at')} | "
+            f"strategy={run.get('candidate_strategy')} | "
+            f"top={coverage.get('with_candidate', 0)}/{coverage.get('total', 0)} | "
+            f"missing={len(missing)}"
+        )
+        if missing:
+            print(f"  missing files: {', '.join(missing)}")
+        if args.verbose:
+            print(f"  query records: {run.get('query_records_path')}")
+            print(f"  results: {run.get('retrieval_package_path')}")
+            print(f"  summary: {run.get('retrieval_summary_path')}")
+            if run.get("review_report_html"):
+                print(f"  review HTML: {run.get('review_report_html')}")
+            for status in run.get("span_candidate_status") or []:
+                marker = "yes" if status.get("has_top_candidate") else "no"
+                print(
+                    f"    span={status.get('span_id')} "
+                    f"query={status.get('query_record_id')} "
+                    f"status={status.get('status')} top_candidate={marker}"
+                )
+    return 0
+
+
 def _print_retrieval_verbose(record: dict[str, Any]) -> None:
     print("\nLab command:")
     print(record["lab_command"])
@@ -843,6 +892,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--run-record", help="Retrieval-run JSON path; defaults to <out>/retrieval_run.json")
     p.add_argument("--verbose", action="store_true", help="Print captured lab command, stdout, and stderr")
     p.set_defaults(func=cmd_retrieve_audio)
+
+    p = sub.add_parser("list-retrieval-runs", help="List retrieval-run packages for one imported book")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--json", action="store_true", help="Print the refreshed run index as JSON")
+    p.add_argument("--verbose", action="store_true", help="Print package paths and per-span top-candidate status")
+    p.set_defaults(func=cmd_list_retrieval_runs)
 
     return parser
 

@@ -2,7 +2,12 @@ import json
 import sys
 
 from main import build_parser
-from src.retrieval_run import materialize_top_ranked_candidates, run_retrieval_audio
+from src.retrieval_run import (
+    materialize_top_ranked_candidates,
+    retrieval_runs_dir,
+    run_retrieval_audio,
+    write_retrieval_run_index,
+)
 
 
 def test_materialize_top_ranked_candidates_extracts_one_candidate_per_row(tmp_path):
@@ -108,6 +113,7 @@ def test_run_retrieval_audio_writes_run_record_and_logs(tmp_path):
     assert (out / "stderr.txt").read_text(encoding="utf-8") == ""
     assert (out / "retrieval_results.jsonl").exists()
     assert (out / "retrieval_summary.json").exists()
+    assert (tmp_path / "retrieval_run_index.json").exists()
 
 
 def test_run_retrieval_audio_records_missing_lab_executable(tmp_path):
@@ -137,6 +143,43 @@ def test_run_retrieval_audio_records_missing_lab_executable(tmp_path):
     assert "definitely-not-a-real-music-lab-command" in record["lab_command"]
     assert (out / "stderr.txt").read_text(encoding="utf-8")
     assert (out / "retrieval_run.json").exists()
+
+
+def test_retrieval_run_index_lists_runs_and_missing_files(tmp_path):
+    runs_dir = tmp_path / "retrieval_runs"
+    run_dir = runs_dir / "run_001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "stdout.txt").write_text("ok\n", encoding="utf-8")
+    (run_dir / "stderr.txt").write_text("", encoding="utf-8")
+    (run_dir / "retrieval_results.jsonl").write_text("", encoding="utf-8")
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+            },
+            {
+                "query_record_id": "book-1-span-b-q1",
+                "span_id": "span-b",
+                "status": "empty",
+            },
+        ],
+    )
+
+    index = write_retrieval_run_index(runs_dir, calibre_book_id=1)
+
+    assert index["run_count"] == 1
+    assert index["runs"][0]["top_candidate_coverage"] == {
+        "with_candidate": 1,
+        "total": 2,
+        "without_candidate": 1,
+    }
+    assert index["runs"][0]["span_candidate_status"][1]["has_top_candidate"] is False
+    assert index["runs"][0]["missing_files"] == ["retrieval_summary_path"]
+    assert (runs_dir / "retrieval_run_index.json").exists()
 
 
 def test_retrieve_audio_cli_runs_fake_lab(tmp_path, capsys):
@@ -184,6 +227,49 @@ def test_retrieve_audio_cli_runs_fake_lab(tmp_path, capsys):
     assert "Lab stdout:" in captured.out
     assert "fake lab ok" in captured.out
     assert "Lab stderr:" in captured.out
+
+
+def test_list_retrieval_runs_cli_refreshes_index_and_reports_coverage(tmp_path, capsys):
+    data_dir = tmp_path / "data"
+    _write_manifest(data_dir)
+    runs_dir = retrieval_runs_dir(data_dir, 42)
+    run_dir = runs_dir / "run_001"
+    run_dir.mkdir(parents=True)
+    (run_dir / "stdout.txt").write_text("ok\n", encoding="utf-8")
+    (run_dir / "stderr.txt").write_text("", encoding="utf-8")
+    (run_dir / "retrieval_results.jsonl").write_text("", encoding="utf-8")
+    (run_dir / "retrieval_summary.json").write_text("{}\n", encoding="utf-8")
+    _write_run_record(
+        run_dir,
+        retrieval_profile="local_fused_v1",
+        top_candidates=[
+            {
+                "query_record_id": "book-42-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+            }
+        ],
+    )
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "list-retrieval-runs",
+            "42",
+            "--verbose",
+        ]
+    )
+
+    assert args.func(args) == 0
+
+    captured = capsys.readouterr()
+    assert "Retrieval runs for: Test Book - Test Author" in captured.out
+    assert "run_001 | exit=0 | profile=local_fused_v1" in captured.out
+    assert "top=1/1" in captured.out
+    assert "span=span-a query=book-42-span-a-q1 status=ok top_candidate=yes" in captured.out
+    assert (runs_dir / "retrieval_run_index.json").exists()
 
 
 def _write_fake_lab_project(tmp_path):
@@ -253,3 +339,57 @@ if __name__ == "__main__":
         encoding="utf-8",
     )
     return lab_project
+
+
+def _write_run_record(
+    run_dir,
+    *,
+    retrieval_profile="fake",
+    top_candidates=None,
+):
+    record = {
+        "schema_version": 1,
+        "run_id": run_dir.name,
+        "query_records_path": str(run_dir / "query_records.generated.jsonl"),
+        "retrieval_profile": retrieval_profile,
+        "profile_config_path": None,
+        "lab_project": None,
+        "lab_command": "music-lab retrieve-query-records ...",
+        "exit_status": 0,
+        "stdout_path": str(run_dir / "stdout.txt"),
+        "stderr_path": str(run_dir / "stderr.txt"),
+        "retrieval_package_path": str(run_dir / "retrieval_results.jsonl"),
+        "retrieval_summary_path": str(run_dir / "retrieval_summary.json"),
+        "review_report_html": None,
+        "mode": "package-only",
+        "candidate_strategy": "top_ranked",
+        "top_candidates": top_candidates or [],
+        "created_at": "2026-06-28T00:00:00+00:00",
+    }
+    (run_dir / "retrieval_run.json").write_text(json.dumps(record) + "\n", encoding="utf-8")
+
+
+def _write_manifest(data_dir):
+    data_dir.mkdir(parents=True)
+    manifest = {
+        "schema_version": 1,
+        "libraries": [],
+        "books": [
+            {
+                "calibre_book_id": 42,
+                "calibre_uuid": "uuid-42",
+                "title": "Test Book",
+                "authors": ["Test Author"],
+                "library_path": str(data_dir),
+                "calibre_path": "Test Book",
+                "formats": {},
+                "preferred_epub_path": None,
+                "annots_key": None,
+                "prepared": True,
+            }
+        ],
+    }
+    (data_dir / "calibre_library_manifest.json").write_text(
+        json.dumps(manifest) + "\n",
+        encoding="utf-8",
+    )

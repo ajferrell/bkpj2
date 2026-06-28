@@ -91,6 +91,14 @@ Run a lab retrieval package and write a bkpj2 retrieval-run pointer:
 .\.venv\Scripts\python.exe main.py retrieve-audio --query-records .\query_records.generated.jsonl --retrieval-profile local_fused_v1 --profile-config C:\dev\music-retrieval-lab\configs\retrieval_profile.yml --lab-project C:\dev\music-retrieval-lab --lab-python C:\dev\music-retrieval-lab\.venv\Scripts\python.exe --candidate-strategy top_ranked --out .\data\books\5\retrieval_runs\run_002 --verbose
 ```
 
+List retrieval runs for an imported book and refresh the small per-book index:
+
+```powershell
+.\.venv\Scripts\python.exe main.py list-retrieval-runs "Book Title"
+.\.venv\Scripts\python.exe main.py list-retrieval-runs "Book Title" --verbose
+.\.venv\Scripts\python.exe main.py list-retrieval-runs "Book Title" --json
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -137,6 +145,9 @@ Main local artifacts:
   with package pointers, captured lab stdout/stderr, candidate strategy, top
   candidate per span, and `music-retrieval-lab` package outputs such as
   `retrieval_results.jsonl` and `retrieval_summary.json`.
+- `data/books/<calibre_book_id>/retrieval_runs/retrieval_run_index.json`: a
+  scan-derived run index with package paths, missing-file checks, and top
+  candidate coverage without duplicating lab candidate rankings.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
 The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The

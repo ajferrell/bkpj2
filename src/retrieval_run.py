@@ -10,6 +10,7 @@ from typing import Any
 
 
 RETRIEVAL_RUN_SCHEMA_VERSION = 1
+RETRIEVAL_RUN_INDEX_SCHEMA_VERSION = 1
 DEFAULT_CANDIDATE_STRATEGY = "top_ranked"
 
 
@@ -107,7 +108,50 @@ def run_retrieval_audio(
     record_path.parent.mkdir(parents=True, exist_ok=True)
     record_path.write_text(json.dumps(record, indent=2, sort_keys=True) + "\n", encoding="utf-8")
     record["retrieval_run_record_path"] = str(record_path)
+    write_retrieval_run_index(out.parent)
     return record
+
+
+def retrieval_runs_dir(data_dir: str | Path, calibre_book_id: int | str) -> Path:
+    return Path(data_dir) / "books" / str(calibre_book_id) / "retrieval_runs"
+
+
+def retrieval_run_index_path(runs_dir: str | Path) -> Path:
+    return Path(runs_dir) / "retrieval_run_index.json"
+
+
+def write_retrieval_run_index(
+    runs_dir: str | Path,
+    *,
+    calibre_book_id: int | str | None = None,
+) -> dict[str, Any]:
+    index = build_retrieval_run_index(runs_dir, calibre_book_id=calibre_book_id)
+    path = retrieval_run_index_path(runs_dir)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(index, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    index["retrieval_run_index_path"] = str(path.resolve())
+    return index
+
+
+def build_retrieval_run_index(
+    runs_dir: str | Path,
+    *,
+    calibre_book_id: int | str | None = None,
+) -> dict[str, Any]:
+    root = Path(runs_dir).resolve()
+    run_records = sorted(
+        path
+        for path in root.glob("*/retrieval_run.json")
+        if path.parent.name and path.parent != root
+    )
+    runs = [_summarize_retrieval_run(path, root) for path in run_records]
+    return {
+        "schema_version": RETRIEVAL_RUN_INDEX_SCHEMA_VERSION,
+        "calibre_book_id": str(calibre_book_id) if calibre_book_id is not None else None,
+        "retrieval_runs_dir": str(root),
+        "run_count": len(runs),
+        "runs": runs,
+    }
 
 
 def materialize_top_ranked_candidates(results_path: str | Path) -> list[dict[str, Any]]:
@@ -149,6 +193,88 @@ def materialize_top_ranked_candidates(results_path: str | Path) -> list[dict[str
             }
         )
     return materialized
+
+
+def _summarize_retrieval_run(record_path: Path, runs_dir: Path) -> dict[str, Any]:
+    record = _read_json(record_path)
+    top_candidates = record.get("top_candidates")
+    if not isinstance(top_candidates, list):
+        top_candidates = []
+    span_status = [_span_candidate_status(candidate) for candidate in top_candidates]
+    with_candidate = sum(1 for status in span_status if status["has_top_candidate"])
+    return {
+        "run_id": record.get("run_id") or record_path.parent.name,
+        "retrieval_run_record_path": _portable_path(record_path, runs_dir),
+        "query_records_path": record.get("query_records_path"),
+        "retrieval_profile": record.get("retrieval_profile"),
+        "profile_config_path": record.get("profile_config_path"),
+        "retrieval_package_path": record.get("retrieval_package_path"),
+        "retrieval_summary_path": record.get("retrieval_summary_path"),
+        "review_report_html": record.get("review_report_html"),
+        "created_at": record.get("created_at"),
+        "exit_status": record.get("exit_status"),
+        "mode": record.get("mode"),
+        "candidate_strategy": record.get("candidate_strategy"),
+        "top_candidate_coverage": {
+            "with_candidate": with_candidate,
+            "total": len(span_status),
+            "without_candidate": len(span_status) - with_candidate,
+        },
+        "span_candidate_status": span_status,
+        "missing_files": _missing_retrieval_files(record, record_path),
+    }
+
+
+def _span_candidate_status(candidate: Any) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        return {
+            "query_record_id": None,
+            "span_id": None,
+            "status": "invalid_candidate_summary",
+            "has_top_candidate": False,
+        }
+    return {
+        "query_record_id": candidate.get("query_record_id"),
+        "span_id": candidate.get("span_id"),
+        "status": candidate.get("status") or "unknown",
+        "has_top_candidate": bool(candidate.get("asset_id")),
+    }
+
+
+def _missing_retrieval_files(record: dict[str, Any], record_path: Path) -> list[str]:
+    fields = [
+        "stdout_path",
+        "stderr_path",
+        "retrieval_package_path",
+        "retrieval_summary_path",
+        "review_report_html",
+    ]
+    missing: list[str] = []
+    for field in fields:
+        value = record.get(field)
+        if not value:
+            continue
+        path = _resolve_record_path(value, record_path)
+        if not path.exists():
+            missing.append(field)
+    return missing
+
+
+def _resolve_record_path(value: str | Path, record_path: Path) -> Path:
+    path = Path(value)
+    if path.is_absolute():
+        return path
+    if path.exists():
+        return path.resolve()
+    return (record_path.parent / path).resolve()
+
+
+def _portable_path(path: str | Path, base: Path) -> str:
+    resolved = Path(path).resolve()
+    try:
+        return str(resolved.relative_to(base.resolve()))
+    except ValueError:
+        return str(resolved)
 
 
 def _build_lab_command(
@@ -205,6 +331,14 @@ def _read_jsonl(path: str | Path) -> list[dict[str, Any]]:
                 raise ValueError(f"Invalid JSONL at {path}:{line_number}: expected object")
             rows.append(row)
     return rows
+
+
+def _read_json(path: str | Path) -> dict[str, Any]:
+    with Path(path).open("r", encoding="utf-8") as handle:
+        value = json.load(handle)
+    if not isinstance(value, dict):
+        raise ValueError(f"Invalid JSON at {path}: expected object")
+    return value
 
 
 def _first_ranked_candidate(candidates: list[Any]) -> dict[str, Any]:
