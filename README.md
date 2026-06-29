@@ -121,6 +121,14 @@ Play a short fixed-dwell preview from a playback plan:
 .\.venv\Scripts\python.exe main.py play-preview .\data\books\5\retrieval_runs\run_001\playback_plan.json --dry-run --max-spans 3
 ```
 
+Follow the open Calibre viewer position with a playback plan:
+
+```powershell
+.\.venv\Scripts\python.exe main.py follow-live-audio 11 .\data\books\11\retrieval_runs\run_ollama_001\playback_plan.json --dry-run --once
+.\.venv\Scripts\python.exe main.py follow-live-audio 11 .\data\books\11\retrieval_runs\run_ollama_001\playback_plan.json --dry-run --once --verbose
+.\.venv\Scripts\python.exe main.py follow-live-audio 11 .\data\books\11\retrieval_runs\run_ollama_001\playback_plan.json --min-stable-polls 2 --crossfade-seconds 4 --gain 0.8
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -173,6 +181,7 @@ Main local artifacts:
 - `data/books/<calibre_book_id>/retrieval_runs/<run_id>/playback_plan.json`: a
   derived per-span playback plan that points playable entries at normalized
   master/runtime audio files and keeps chunk paths as retrieval evidence only.
+  New plans also carry the source span offsets needed for live CFI lookup.
   When explicit master paths are absent, the current local fallback derives
   `sounds_v1` masters from chunk paths under
   `...\sounds_v1\corpus\<backend>\chunks\`.

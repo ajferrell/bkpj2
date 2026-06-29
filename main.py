@@ -53,7 +53,7 @@ from src.query_export import (
     load_text_blocks_for_export,
     query_records_path,
 )
-from src.playback_preview import play_preview
+from src.playback_preview import follow_live_audio, play_preview
 from src.retrieval_run import (
     build_playback_plan,
     retrieval_runs_dir,
@@ -593,6 +593,52 @@ def cmd_play_preview(args: argparse.Namespace) -> int:
     return 0 if schedule else 1
 
 
+def cmd_follow_live_audio(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    if (args.spine_index is None) != (args.local_char_offset is None):
+        raise ValueError("Use both --spine-index and --local-char-offset for manual dry-run coordinates")
+    if (args.spine_index is not None or args.local_char_offset is not None) and not args.dry_run:
+        raise ValueError("Manual --spine-index/--local-char-offset follow mode is dry-run only")
+
+    def read_position() -> dict[str, Any]:
+        if args.spine_index is not None and args.local_char_offset is not None:
+            return {
+                "spine_index": args.spine_index,
+                "href": _href_for_spine(load_timeline(args.data_dir, book["calibre_book_id"]), args.spine_index),
+                "local_char_offset": args.local_char_offset,
+                "resolver": "manual",
+            }
+        live = read_live_annotation_for_book(book, annots_dir=args.annots_dir)
+        if not live:
+            return {"error": "live_annotation_missing"}
+        result = run_calibre_cfi_probe(book.get("preferred_epub_path"), live.epubcfi)
+        if result.get("error"):
+            return result
+        result["source_cfi"] = live.epubcfi
+        return result
+
+    max_polls = 1 if args.once else args.max_polls
+    print("Following live audio. Press Ctrl+C to stop.")
+    try:
+        events = follow_live_audio(
+            playback_plan_path=args.playback_plan,
+            position_reader=read_position,
+            poll_interval=args.poll_interval,
+            min_stable_polls=args.min_stable_polls,
+            missing_grace_polls=args.missing_grace_polls,
+            dwell_seconds=args.dwell_seconds,
+            crossfade_seconds=args.crossfade_seconds,
+            gain=args.gain,
+            dry_run=args.dry_run,
+            max_polls=max_polls,
+            on_event=_follow_event_printer(verbose=args.verbose),
+        )
+    except KeyboardInterrupt:
+        print("\nStopped.")
+        return 0
+    return 0 if events else 1
+
+
 def _print_retrieval_verbose(record: dict[str, Any]) -> None:
     print("\nLab command:")
     print(record["lab_command"])
@@ -605,6 +651,49 @@ def _print_file_section(title: str, path_value: str) -> None:
     text = path.read_text(encoding="utf-8") if path.exists() else ""
     print(f"\n{title}:")
     print(text.rstrip() if text.strip() else "(empty)")
+
+
+def _follow_event_printer(*, verbose: bool = False):
+    last_signature: tuple[Any, ...] | None = None
+
+    def print_event(event: dict[str, Any]) -> None:
+        nonlocal last_signature
+        decision = event.get("decision") or {}
+        entry = event.get("entry")
+        action = event.get("action")
+        status = decision.get("status")
+        signature = (
+            action,
+            status,
+            entry.get("span_id") if isinstance(entry, dict) else None,
+            decision.get("error"),
+            event.get("stable_polls") if action == "pending" else None,
+        )
+        if signature == last_signature:
+            return
+        last_signature = signature
+
+        if isinstance(entry, dict):
+            print(
+                f"follow-live-audio: action={action} status={status} "
+                f"span={entry.get('span_id')} sequence={entry.get('sequence')} "
+                f"asset={entry.get('asset_id')} start={entry.get('start_seconds')}"
+            )
+            if verbose:
+                span = entry.get("span") if isinstance(entry.get("span"), dict) else {}
+                if span.get("query_text"):
+                    print(f"  query: {span['query_text']}")
+                if span.get("excerpt_preview"):
+                    print(f"  text: {span['excerpt_preview']}")
+                print(f"  master: {entry.get('master_audio_path')}")
+                print(f"  chunk: {entry.get('chunk_path') or '(none)'}")
+        else:
+            print(
+                f"follow-live-audio: action={action} status={status} "
+                f"error={decision.get('error') or '(none)'}"
+            )
+
+    return print_event
 
 
 def _no_probe(epub_path: str | None, epubcfi: str) -> dict[str, Any]:
@@ -989,6 +1078,24 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--gain", type=float, default=0.8, help="Linear output gain")
     p.add_argument("--dry-run", action="store_true", help="Print the preview schedule without opening audio")
     p.set_defaults(func=cmd_play_preview)
+
+    p = sub.add_parser("follow-live-audio", help="Follow live Calibre position with a playback plan")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("playback_plan", help="Path to playback_plan.json")
+    p.add_argument("--annots-dir", help="Override Calibre viewer annots directory")
+    p.add_argument("--poll-interval", type=float, default=1.0, help="Seconds between live CFI polls")
+    p.add_argument("--min-stable-polls", type=int, default=2, help="Polls required before switching entries")
+    p.add_argument("--missing-grace-polls", type=int, default=3, help="Failed polls to tolerate before stopping audio")
+    p.add_argument("--dwell-seconds", type=float, default=20.0, help="Compatibility validation value; live audio streams until the active span changes")
+    p.add_argument("--crossfade-seconds", type=float, default=4.0, help="Transition overlap between entries")
+    p.add_argument("--gain", type=float, default=0.8, help="Linear output gain")
+    p.add_argument("--dry-run", action="store_true", help="Print live decisions without opening audio")
+    p.add_argument("--verbose", action="store_true", help="Print query text, text preview, and audio paths on changes")
+    p.add_argument("--once", action="store_true", help="Poll once and exit")
+    p.add_argument("--max-polls", type=int, help="Maximum polls before exiting")
+    p.add_argument("--spine-index", type=int, help="Manual resolved spine index for dry-run smoke tests")
+    p.add_argument("--local-char-offset", type=int, help="Manual resolved local character offset for dry-run smoke tests")
+    p.set_defaults(func=cmd_follow_live_audio)
 
     return parser
 

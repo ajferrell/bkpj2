@@ -279,6 +279,27 @@ def test_build_playback_plan_uses_master_path_and_preserves_chunk_evidence(tmp_p
     master = tmp_path / "masters" / "asset-a.wav"
     master.parent.mkdir()
     master.write_text("fake wav", encoding="utf-8")
+    query_records = run_dir / "query_records.generated.jsonl"
+    query_records.write_text(
+        json.dumps(
+            {
+                "record_id": "book-1-span-a-q1",
+                "span": {
+                    "span_id": "span-a",
+                    "spine_index": 0,
+                    "href": "chapter.xhtml",
+                    "start_local_offset": 10,
+                    "end_local_offset": 40,
+                    "text_block_start": 1,
+                    "text_block_end": 3,
+                    "excerpt": "Long source excerpt for the active passage.",
+                },
+                "query": {"text": "cold chapel rain"},
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
     _write_run_record(
         run_dir,
         top_candidates=[
@@ -313,6 +334,10 @@ def test_build_playback_plan_uses_master_path_and_preserves_chunk_evidence(tmp_p
     assert entry["master_audio_path"] == str(master.resolve())
     assert entry["chunk_path"] == "chunk.wav"
     assert entry["start_seconds"] == 4.0
+    assert entry["span"]["spine_index"] == 0
+    assert entry["span"]["text_block_start"] == 1
+    assert entry["span"]["query_text"] == "cold chapel rain"
+    assert entry["span"]["excerpt_preview"] == "Long source excerpt for the active passage."
     assert (run_dir / "playback_plan.json").exists()
 
 

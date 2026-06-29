@@ -145,9 +145,15 @@ def build_playback_plan(
     top_candidates = record.get("top_candidates")
     if not isinstance(top_candidates, list):
         top_candidates = []
+    span_lookup = _load_query_span_lookup(record.get("query_records_path"), record_path=record_path)
 
     entries = [
-        _build_playback_plan_entry(candidate, sequence=index, record_path=record_path)
+        _build_playback_plan_entry(
+            candidate,
+            sequence=index,
+            record_path=record_path,
+            span_lookup=span_lookup,
+        )
         for index, candidate in enumerate(top_candidates, start=1)
     ]
     summary = _playback_plan_summary(entries)
@@ -261,6 +267,7 @@ def _build_playback_plan_entry(
     *,
     sequence: int,
     record_path: Path,
+    span_lookup: dict[str, dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not isinstance(candidate, dict):
         return {
@@ -290,6 +297,9 @@ def _build_playback_plan_entry(
         "rank": candidate.get("rank"),
         "score": candidate.get("score"),
     }
+    span = _candidate_source_span(candidate, span_lookup or {})
+    if span:
+        entry["span"] = span
     if not candidate.get("asset_id"):
         entry["status"] = candidate.get("status") or "no_top_candidate"
         entry["playable"] = False
@@ -303,6 +313,74 @@ def _build_playback_plan_entry(
             entry["status"] = "missing_master_file"
             entry["playable"] = False
     return entry
+
+
+def _load_query_span_lookup(
+    query_records_path: Any,
+    *,
+    record_path: Path,
+) -> dict[str, dict[str, Any]]:
+    if not query_records_path:
+        return {}
+    path = _resolve_record_path(query_records_path, record_path)
+    if not path.exists():
+        return {}
+
+    lookup: dict[str, dict[str, Any]] = {}
+    for row in _read_jsonl(path):
+        span = row.get("span")
+        if not isinstance(span, dict):
+            continue
+        slim = _slim_source_span(span, row)
+        if not slim:
+            continue
+        record_id = row.get("record_id")
+        span_id = span.get("span_id")
+        if record_id:
+            lookup[str(record_id)] = slim
+        if span_id:
+            lookup[str(span_id)] = slim
+    return lookup
+
+
+def _candidate_source_span(
+    candidate: dict[str, Any],
+    span_lookup: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    for key in (candidate.get("query_record_id"), candidate.get("span_id")):
+        if key and str(key) in span_lookup:
+            return dict(span_lookup[str(key)])
+    return None
+
+
+def _slim_source_span(span: dict[str, Any], record: dict[str, Any] | None = None) -> dict[str, Any]:
+    keys = (
+        "span_id",
+        "spine_index",
+        "href",
+        "start_local_offset",
+        "end_local_offset",
+        "text_block_start",
+        "text_block_end",
+        "selection_method",
+        "word_count",
+    )
+    slim = {key: span.get(key) for key in keys if key in span}
+    if not all(key in slim for key in ("span_id", "spine_index", "start_local_offset", "end_local_offset")):
+        return {}
+    if span.get("excerpt"):
+        slim["excerpt_preview"] = _compact_preview(str(span["excerpt"]))
+    query = (record or {}).get("query") if isinstance((record or {}).get("query"), dict) else {}
+    if query.get("text"):
+        slim["query_text"] = str(query["text"])
+    return slim
+
+
+def _compact_preview(text: str, limit: int = 240) -> str:
+    compact = re.sub(r"\s+", " ", text).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[:limit].rstrip() + "..."
 
 
 def _candidate_master_path(candidate: dict[str, Any]) -> tuple[str | None, str | None]:
