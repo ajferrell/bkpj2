@@ -1,4 +1,6 @@
 import json
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from main import build_parser
 from src.anchors import (
@@ -10,6 +12,7 @@ from src.anchors import (
 from src.calibre_native import save_manifest
 from src.query_export import (
     FakeQueryGenerator,
+    OllamaQueryGenerator,
     append_query_record,
     build_batch_query_spans,
     build_generated_query_record,
@@ -17,6 +20,7 @@ from src.query_export import (
     build_query_span,
     drift_warnings_for_export,
     generate_query_records,
+    build_generation_prompt,
     load_text_blocks_for_export,
     query_records_path,
     validate_query_record,
@@ -79,6 +83,61 @@ def prepare_fake_book(tmp_path, debug_text=True):
         spine_extractor=extractor,
     )
     return book, data_dir
+
+
+def write_needs_query_file(tmp_path, max_spans=1):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    input_path = tmp_path / "query_records.needs_query.jsonl"
+    for span in build_batch_query_spans(
+        book=book,
+        timeline=timeline,
+        text_blocks=blocks,
+        max_spans=max_spans,
+        target_words=14,
+        min_words=8,
+        max_words=20,
+    ):
+        source = build_query_record(
+            book=book,
+            timeline=timeline,
+            span=span,
+            query_text="",
+            query_mode="needs_query",
+            generation_method="batch_placeholder_v1",
+            review_status="needs_query",
+            allow_empty_query=True,
+        )
+        append_query_record(input_path, source)
+    return book, data_dir, input_path
+
+
+def start_fake_ollama_server(*, status=200, response_text="tense sparse strings; slow pulse; no vocals"):
+    requests = []
+
+    class Handler(BaseHTTPRequestHandler):
+        def do_POST(self):
+            length = int(self.headers.get("Content-Length", "0"))
+            body = self.rfile.read(length).decode("utf-8")
+            requests.append({"path": self.path, "body": json.loads(body)})
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.end_headers()
+            if status == 200:
+                payload = {"model": "qwen3:4b", "response": response_text, "done": True}
+            else:
+                payload = {"error": "model unavailable"}
+            self.wfile.write(json.dumps(payload).encode("utf-8"))
+
+        def log_message(self, format, *args):
+            return
+
+    server = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    base_url = f"http://127.0.0.1:{server.server_address[1]}"
+    return server, base_url, requests
 
 
 def test_load_text_blocks_uses_debug_text_sidecar(tmp_path):
@@ -298,6 +357,37 @@ def test_generated_query_record_preserves_span_and_adds_generation_metadata(tmp_
     assert source["query"]["mode"] == "needs_query"
 
 
+def test_generation_prompt_matches_manual_audio_intent_shape(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=build_batch_query_spans(
+            book=book,
+            timeline=timeline,
+            text_blocks=blocks,
+            max_spans=1,
+            target_words=14,
+            min_words=8,
+            max_words=20,
+        )[0],
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+
+    prompt = build_generation_prompt(source, "audio_intent_v1")
+
+    assert "Compress the passage into one audio-intent query." in prompt
+    assert "Return one comma-separated phrase, 12-24 words." in prompt
+    assert "No proper nouns, no character names, no plot summary, no labels, no full sentence." in prompt
+    assert "Return only the query phrase." in prompt
+
+
 def test_generate_queries_writes_generated_records_and_cache(tmp_path):
     book, data_dir = prepare_fake_book(tmp_path)
     timeline = load_timeline(data_dir, book["calibre_book_id"])
@@ -342,6 +432,110 @@ def test_generate_queries_writes_generated_records_and_cache(tmp_path):
     assert records[0]["query"]["model"] == "fake-audio-intent-v1"
     assert "instrumental audio intent" in records[0]["query"]["text"]
     assert (tmp_path / "query_records.generated.jsonl.cache.json").exists()
+
+
+def test_generate_queries_cli_ollama_posts_request_and_uses_cache(tmp_path, capsys):
+    _, _, input_path = write_needs_query_file(tmp_path)
+    output = tmp_path / "query_records.generated.jsonl"
+    server, base_url, requests = start_fake_ollama_server()
+    parser = build_parser()
+
+    try:
+        args = parser.parse_args(
+            [
+                "generate-queries",
+                "--input",
+                str(input_path),
+                "--out",
+                str(output),
+                "--provider",
+                "ollama",
+                "--ollama-url",
+                base_url,
+                "--model",
+                "qwen3:4b-instruct",
+                "--timeout",
+                "2",
+                "--temperature",
+                "0.15",
+                "--num-predict",
+                "32",
+                "--keep-alive",
+                "5m",
+                "--overwrite",
+            ]
+        )
+        assert args.func(args) == 0
+        first = capsys.readouterr()
+
+        args = parser.parse_args(
+            [
+                "generate-queries",
+                "--input",
+                str(input_path),
+                "--out",
+                str(output),
+                "--provider",
+                "ollama",
+                "--ollama-url",
+                base_url,
+                "--model",
+                "qwen3:4b-instruct",
+                "--overwrite",
+            ]
+        )
+        assert args.func(args) == 0
+        second = capsys.readouterr()
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert len(requests) == 1
+    payload = requests[0]["body"]
+    assert requests[0]["path"] == "/api/generate"
+    assert payload["model"] == "qwen3:4b-instruct"
+    assert payload["stream"] is False
+    assert payload["think"] is False
+    assert payload["options"] == {"temperature": 0.15, "num_predict": 32}
+    assert payload["keep_alive"] == "5m"
+    assert "Return one comma-separated phrase, 12-24 words." in payload["prompt"]
+    assert "No proper nouns, no character names, no plot summary, no labels, no full sentence." in payload["prompt"]
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert len(records) == 1
+    assert records[0]["query"]["provider"] == "ollama"
+    assert records[0]["query"]["model"] == "qwen3:4b-instruct"
+    assert records[0]["query"]["text"] == "tense sparse strings; slow pulse; no vocals"
+    assert "Generated query records: 1" in first.out
+    assert "Cache hits: 1" in second.out
+
+
+def test_ollama_generator_failure_is_written_to_error_sidecar(tmp_path):
+    _, _, input_path = write_needs_query_file(tmp_path)
+    output = tmp_path / "query_records.generated.jsonl"
+    errors = tmp_path / "query_records.generated.errors.jsonl"
+    server, base_url, requests = start_fake_ollama_server(status=500)
+
+    try:
+        summary = generate_query_records(
+            input_path=input_path,
+            output_path=output,
+            generator=OllamaQueryGenerator(base_url=base_url, model_id="qwen3:4b", timeout_seconds=2),
+            prompt_version="audio_intent_v1",
+            errors_path=errors,
+            overwrite=True,
+        )
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    error_record = json.loads(errors.read_text(encoding="utf-8").strip())
+    assert len(requests) == 1
+    assert summary["generated_count"] == 0
+    assert summary["failed_count"] == 1
+    assert output.read_text(encoding="utf-8") == ""
+    assert "Ollama request failed" in error_record["error"]
+    assert base_url in error_record["error"]
+    assert "qwen3:4b" in error_record["error"]
 
 
 def test_generate_queries_records_failures_in_sidecar(tmp_path):

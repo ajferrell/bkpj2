@@ -82,9 +82,14 @@ Export deterministic query-span candidates for manual query authoring:
 Generate local audio-intent query records from `needs_query` placeholders:
 
 ```powershell
+.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider ollama --model qwen3:4b-instruct --ollama-url http://localhost:11434 --limit 3 --overwrite
 .\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider local-command --command C:\path\to\local-query-generator.exe --prompt-version audio_intent_v1
 .\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider fake
 ```
+
+The Ollama provider expects the operator to install Ollama separately, run the
+local service, and pull the requested model first. bkpj2 does not install
+Ollama or download models.
 
 Run a lab retrieval package and write a bkpj2 retrieval-run pointer:
 

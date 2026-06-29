@@ -6,7 +6,10 @@ import copy
 import hashlib
 import json
 import subprocess
+import urllib.error
+import urllib.request
 from pathlib import Path
+from urllib.parse import urljoin
 from typing import Any, Callable, Protocol
 
 from .anchors import (
@@ -95,6 +98,75 @@ class LocalCommandQueryGenerator:
         query_text = result.stdout.strip()
         if not query_text:
             raise RuntimeError("local command produced empty query text")
+        return query_text
+
+
+class OllamaQueryGenerator:
+    """Adapter for Ollama's local non-streaming /api/generate HTTP endpoint."""
+
+    provider = "ollama"
+
+    def __init__(
+        self,
+        *,
+        base_url: str = "http://localhost:11434",
+        model_id: str = "qwen3:4b-instruct",
+        timeout_seconds: float = 60.0,
+        temperature: float | None = 0.2,
+        num_predict: int | None = 48,
+        keep_alive: str | None = None,
+    ) -> None:
+        self.base_url = base_url.rstrip("/") + "/"
+        self.model_id = model_id
+        self.timeout_seconds = timeout_seconds
+        self.temperature = temperature
+        self.num_predict = num_predict
+        self.keep_alive = keep_alive
+
+    def generate(self, record: dict[str, Any], prompt: str) -> str:
+        payload: dict[str, Any] = {
+            "model": self.model_id,
+            "prompt": prompt,
+            "stream": False,
+            "think": False,
+        }
+        options: dict[str, Any] = {}
+        if self.temperature is not None:
+            options["temperature"] = self.temperature
+        if self.num_predict is not None:
+            options["num_predict"] = self.num_predict
+        if options:
+            payload["options"] = options
+        if self.keep_alive is not None:
+            payload["keep_alive"] = self.keep_alive
+
+        url = urljoin(self.base_url, "api/generate")
+        request = urllib.request.Request(
+            url,
+            data=json.dumps(payload).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                raw = response.read().decode("utf-8")
+        except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace").strip()
+            detail = f": {body}" if body else ""
+            raise RuntimeError(f"Ollama request failed for {url} model {self.model_id}: HTTP {exc.code}{detail}") from exc
+        except urllib.error.URLError as exc:
+            raise RuntimeError(f"Ollama request failed for {url} model {self.model_id}: {exc.reason}") from exc
+        except TimeoutError as exc:
+            raise RuntimeError(f"Ollama request timed out for {url} model {self.model_id}") from exc
+
+        try:
+            data = json.loads(raw)
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Ollama returned invalid JSON for {url} model {self.model_id}") from exc
+
+        query_text = str(data.get("response") or "").strip()
+        if not query_text:
+            raise RuntimeError(f"Ollama returned empty response for {url} model {self.model_id}")
         return query_text
 
 
@@ -401,9 +473,13 @@ def build_generation_prompt(record: dict[str, Any], prompt_version: str) -> str:
     return "\n".join(
         [
             f"Prompt version: {prompt_version}",
-            "Write one compact music retrieval query for the excerpt.",
-            "Focus on mood, instrumentation, energy, tempo, and vocal policy.",
-            "Return only the query text.",
+            "Compress the passage into one audio-intent query.",
+            "Return one comma-separated phrase, 12-24 words.",
+            "Preserve the strongest concrete sensory details and the dominant pressure of the moment.",
+            "Use words that would help find background music or ambience: material texture, physical space, threat level, pace, emotional weight, and sound character.",
+            "Do not describe who did what. Describe the atmosphere the listener should hear.",
+            "No proper nouns, no character names, no plot summary, no labels, no full sentence.",
+            "Return only the query phrase.",
             f"Book: {book.get('title') or ''}",
             f"Span id: {span.get('span_id') or ''}",
             f"Excerpt hash: {span.get('excerpt_hash') or ''}",

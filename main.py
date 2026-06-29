@@ -43,6 +43,7 @@ from src.cfi_fixtures import (
 from src.query_export import (
     FakeQueryGenerator,
     LocalCommandQueryGenerator,
+    OllamaQueryGenerator,
     append_query_record,
     build_batch_query_spans,
     generate_query_records,
@@ -620,7 +621,7 @@ def _read_query_text(args: argparse.Namespace) -> str:
     raise ValueError("Provide manual query text with --query-text or --query-file")
 
 
-def _query_generator_from_args(args: argparse.Namespace) -> FakeQueryGenerator | LocalCommandQueryGenerator:
+def _query_generator_from_args(args: argparse.Namespace) -> FakeQueryGenerator | LocalCommandQueryGenerator | OllamaQueryGenerator:
     if args.provider == "fake":
         if args.model:
             generator = FakeQueryGenerator()
@@ -634,6 +635,15 @@ def _query_generator_from_args(args: argparse.Namespace) -> FakeQueryGenerator |
             command=args.command,
             args=args.command_arg,
             model_id=args.model,
+        )
+    if args.provider == "ollama":
+        return OllamaQueryGenerator(
+            base_url=args.ollama_url,
+            model_id=args.model or "qwen3:4b-instruct",
+            timeout_seconds=args.timeout,
+            temperature=args.temperature,
+            num_predict=args.num_predict,
+            keep_alive=args.keep_alive,
         )
     raise ValueError(f"Unsupported query generator provider: {args.provider}")
 
@@ -909,13 +919,21 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--out", help="Generated JSONL output path")
     p.add_argument(
         "--provider",
-        choices=["fake", "local-command"],
+        choices=["fake", "local-command", "ollama"],
         default="local-command",
         help="Generation adapter to use",
     )
     p.add_argument("--command", help="Local command executable; reads prompt on stdin and writes query text")
     p.add_argument("--command-arg", action="append", default=[], help="Argument passed to --command")
-    p.add_argument("--model", help="Model/provider id to store in generated query records")
+    p.add_argument(
+        "--model",
+        help="Model/provider id to store in generated query records; Ollama defaults to qwen3:4b-instruct",
+    )
+    p.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL for --provider ollama")
+    p.add_argument("--timeout", type=float, default=60.0, help="Per-record provider timeout in seconds")
+    p.add_argument("--temperature", type=float, default=0.2, help="Ollama generation temperature")
+    p.add_argument("--num-predict", type=int, default=48, help="Ollama maximum generated tokens")
+    p.add_argument("--keep-alive", help="Optional Ollama keep_alive duration")
     p.add_argument("--prompt-version", default="audio_intent_v1")
     p.add_argument("--generation-method", default="local_model_audio_intent_v1")
     p.add_argument("--cache", help="Generation cache JSON path")
