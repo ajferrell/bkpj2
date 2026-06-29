@@ -52,6 +52,7 @@ from src.query_export import (
     load_text_blocks_for_export,
     query_records_path,
 )
+from src.playback_preview import play_preview
 from src.retrieval_run import (
     build_playback_plan,
     retrieval_runs_dir,
@@ -562,6 +563,35 @@ def cmd_build_playback_plan(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_play_preview(args: argparse.Namespace) -> int:
+    result = play_preview(
+        args.playback_plan,
+        max_spans=args.max_spans,
+        start_at=args.start_at,
+        dwell_seconds=args.dwell_seconds,
+        crossfade_seconds=args.crossfade_seconds,
+        gain=args.gain,
+        dry_run=args.dry_run,
+    )
+
+    schedule = result["schedule"]
+    if not schedule:
+        print("No playable entries found.")
+        return 1
+    print(f"Preview entries: {len(schedule)}")
+    for item in schedule:
+        print(
+            f"  {item.get('sequence')}: status={item.get('status')} "
+            f"span={item.get('span_id')} asset={item.get('asset_id')} "
+            f"start={item.get('start_seconds')} master={item.get('master_audio_path')}"
+        )
+    if result["played"]:
+        print(f"Played preview: {result['duration_seconds']:.1f}s at {result['sample_rate']} Hz")
+    else:
+        print(f"Did not play audio: {result['reason']}")
+    return 0 if schedule else 1
+
+
 def _print_retrieval_verbose(record: dict[str, Any]) -> None:
     print("\nLab command:")
     print(record["lab_command"])
@@ -931,6 +961,16 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print the written playback plan as JSON")
     p.add_argument("--verbose", action="store_true", help="Print per-span playback plan status")
     p.set_defaults(func=cmd_build_playback_plan)
+
+    p = sub.add_parser("play-preview", help="Play a fixed-dwell audio preview from a playback plan")
+    p.add_argument("playback_plan", help="Path to playback_plan.json")
+    p.add_argument("--max-spans", type=int, default=5, help="Maximum playable entries to preview")
+    p.add_argument("--start-at", type=int, default=1, help="1-based playable-entry offset")
+    p.add_argument("--dwell-seconds", type=float, default=20.0, help="Seconds to play each entry")
+    p.add_argument("--crossfade-seconds", type=float, default=4.0, help="Overlap between entries")
+    p.add_argument("--gain", type=float, default=0.8, help="Linear output gain")
+    p.add_argument("--dry-run", action="store_true", help="Print the preview schedule without opening audio")
+    p.set_defaults(func=cmd_play_preview)
 
     return parser
 

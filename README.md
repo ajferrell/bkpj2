@@ -109,6 +109,13 @@ Build or inspect a playback plan for one retrieval run without starting audio:
 .\.venv\Scripts\python.exe main.py build-playback-plan .\data\books\5\retrieval_runs\run_001\retrieval_run.json --json
 ```
 
+Play a short fixed-dwell preview from a playback plan:
+
+```powershell
+.\.venv\Scripts\python.exe main.py play-preview .\data\books\5\retrieval_runs\run_001\playback_plan.json --max-spans 5 --dwell-seconds 20 --crossfade-seconds 4
+.\.venv\Scripts\python.exe main.py play-preview .\data\books\5\retrieval_runs\run_001\playback_plan.json --dry-run --max-spans 3
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
