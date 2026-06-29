@@ -3,6 +3,7 @@ import sys
 
 from main import build_parser
 from src.retrieval_run import (
+    build_playback_plan,
     materialize_top_ranked_candidates,
     retrieval_runs_dir,
     run_retrieval_audio,
@@ -270,6 +271,180 @@ def test_list_retrieval_runs_cli_refreshes_index_and_reports_coverage(tmp_path, 
     assert "top=1/1" in captured.out
     assert "span=span-a query=book-42-span-a-q1 status=ok top_candidate=yes" in captured.out
     assert (runs_dir / "retrieval_run_index.json").exists()
+
+
+def test_build_playback_plan_uses_master_path_and_preserves_chunk_evidence(tmp_path):
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    master = tmp_path / "masters" / "asset-a.wav"
+    master.parent.mkdir()
+    master.write_text("fake wav", encoding="utf-8")
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+                "master_audio_path": str(master),
+                "audio_chunk_path": "chunk.wav",
+                "chunk_id": "asset-a__0000",
+                "rank": 1,
+                "score": 0.8,
+                "start_seconds": 4.0,
+                "start_policy": "matched_chunk",
+                "loop_policy": "asset_start",
+            }
+        ],
+    )
+
+    plan = build_playback_plan(run_dir / "retrieval_run.json")
+
+    assert plan["summary"] == {
+        "total": 1,
+        "playable": 1,
+        "missing_master_path": 0,
+        "missing_master_file": 0,
+        "no_top_candidate": 0,
+    }
+    entry = plan["entries"][0]
+    assert entry["status"] == "playable"
+    assert entry["master_audio_path"] == str(master.resolve())
+    assert entry["chunk_path"] == "chunk.wav"
+    assert entry["start_seconds"] == 4.0
+    assert (run_dir / "playback_plan.json").exists()
+
+
+def test_build_playback_plan_reports_chunk_only_candidate_as_missing_master(tmp_path):
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+                "asset_path": str(tmp_path / "chunks" / "asset-a__0000.wav"),
+                "audio_chunk_path": str(tmp_path / "chunks" / "asset-a__0000.wav"),
+                "chunk_id": "asset-a__0000",
+                "rank": 1,
+            }
+        ],
+    )
+
+    plan = build_playback_plan(run_dir / "retrieval_run.json")
+
+    assert plan["summary"]["playable"] == 0
+    assert plan["summary"]["missing_master_path"] == 1
+    assert plan["entries"][0]["status"] == "missing_master_path"
+    assert plan["entries"][0]["master_audio_path"] is None
+    assert plan["entries"][0]["chunk_path"].endswith("asset-a__0000.wav")
+
+
+def test_build_playback_plan_derives_sounds_v1_master_from_chunk_path(tmp_path):
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    run_root = tmp_path / "audio-finder" / "out" / "runs" / "sounds_v1"
+    chunk = run_root / "corpus" / "laion_clap_10s_48k" / "chunks" / "_3kWj69CINE__chapter_0001__0000.wav"
+    master = run_root / "prepared" / "masters" / "_3kWj69CINE__chapter_0001.wav"
+    chunk.parent.mkdir(parents=True)
+    master.parent.mkdir(parents=True)
+    chunk.write_text("fake chunk", encoding="utf-8")
+    master.write_text("fake master", encoding="utf-8")
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "_3kWj69CINE__chapter_0001",
+                "asset_path": str(chunk),
+                "audio_chunk_path": str(chunk),
+                "chunk_id": "_3kWj69CINE__chapter_0001__0000",
+                "start_seconds": 0.0,
+            }
+        ],
+    )
+
+    plan = build_playback_plan(run_dir / "retrieval_run.json")
+
+    assert plan["summary"]["playable"] == 1
+    entry = plan["entries"][0]
+    assert entry["status"] == "playable"
+    assert entry["master_audio_path"] == str(master.resolve())
+    assert entry["master_audio_path_source"] == "sounds_v1_chunk_path"
+
+
+def test_build_playback_plan_reports_missing_derived_sounds_v1_master_file(tmp_path):
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    chunk = (
+        tmp_path
+        / "audio-finder"
+        / "out"
+        / "runs"
+        / "sounds_v1"
+        / "corpus"
+        / "m2d_clap_2025_10s_16k"
+        / "chunks"
+        / "asset-a__0007.wav"
+    )
+    chunk.parent.mkdir(parents=True)
+    chunk.write_text("fake chunk", encoding="utf-8")
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+                "asset_path": str(chunk),
+                "audio_chunk_path": str(chunk),
+                "chunk_id": "asset-a__0007",
+            }
+        ],
+    )
+
+    plan = build_playback_plan(run_dir / "retrieval_run.json")
+
+    assert plan["summary"]["playable"] == 0
+    assert plan["summary"]["missing_master_file"] == 1
+    assert plan["entries"][0]["status"] == "missing_master_file"
+    assert plan["entries"][0]["master_audio_path"].endswith(r"sounds_v1\prepared\masters\asset-a.wav")
+
+
+def test_build_playback_plan_cli_writes_plan_and_reports_summary(tmp_path, capsys):
+    run_dir = tmp_path / "run_001"
+    run_dir.mkdir()
+    _write_run_record(
+        run_dir,
+        top_candidates=[
+            {
+                "query_record_id": "book-1-span-a-q1",
+                "span_id": "span-a",
+                "status": "ok",
+                "asset_id": "asset-a",
+                "asset_path": "chunk.wav",
+                "audio_chunk_path": "chunk.wav",
+                "chunk_id": "asset-a__0000",
+            }
+        ],
+    )
+    parser = build_parser()
+    args = parser.parse_args(["build-playback-plan", str(run_dir / "retrieval_run.json"), "--verbose"])
+
+    assert args.func(args) == 0
+
+    captured = capsys.readouterr()
+    assert "Playback plan:" in captured.out
+    assert "missing_master_path=1" in captured.out
+    assert "status=missing_master_path" in captured.out
+    assert (run_dir / "playback_plan.json").exists()
 
 
 def _write_fake_lab_project(tmp_path):

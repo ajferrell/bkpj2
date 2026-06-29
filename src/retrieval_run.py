@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 import subprocess
 from datetime import datetime, timezone
 from pathlib import Path
@@ -11,7 +12,17 @@ from typing import Any
 
 RETRIEVAL_RUN_SCHEMA_VERSION = 1
 RETRIEVAL_RUN_INDEX_SCHEMA_VERSION = 1
+PLAYBACK_PLAN_SCHEMA_VERSION = 1
 DEFAULT_CANDIDATE_STRATEGY = "top_ranked"
+MASTER_AUDIO_PATH_FIELDS = (
+    "master_audio_path",
+    "runtime_audio_path",
+    "normalized_master_path",
+    "normalized_audio_path",
+    "playback_master_path",
+)
+SOUNDS_V1_CORPUS_NAME = "sounds_v1"
+CHUNK_INDEX_SUFFIX_RE = re.compile(r"__(\d{4,})$")
 
 
 def run_retrieval_audio(
@@ -120,6 +131,43 @@ def retrieval_run_index_path(runs_dir: str | Path) -> Path:
     return Path(runs_dir) / "retrieval_run_index.json"
 
 
+def playback_plan_path(retrieval_run_record_path: str | Path) -> Path:
+    return Path(retrieval_run_record_path).resolve().parent / "playback_plan.json"
+
+
+def build_playback_plan(
+    retrieval_run_record_path: str | Path,
+    *,
+    output_path: str | Path | None = None,
+) -> dict[str, Any]:
+    record_path = _resolve_existing_path(retrieval_run_record_path, "retrieval run record")
+    record = _read_json(record_path)
+    top_candidates = record.get("top_candidates")
+    if not isinstance(top_candidates, list):
+        top_candidates = []
+
+    entries = [
+        _build_playback_plan_entry(candidate, sequence=index, record_path=record_path)
+        for index, candidate in enumerate(top_candidates, start=1)
+    ]
+    summary = _playback_plan_summary(entries)
+    plan = {
+        "schema_version": PLAYBACK_PLAN_SCHEMA_VERSION,
+        "retrieval_run_record_path": str(record_path),
+        "run_id": record.get("run_id") or record_path.parent.name,
+        "retrieval_profile": record.get("retrieval_profile"),
+        "candidate_strategy": record.get("candidate_strategy"),
+        "source_top_candidate_count": len(top_candidates),
+        "summary": summary,
+        "entries": entries,
+    }
+    destination = Path(output_path).resolve() if output_path else playback_plan_path(record_path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination.write_text(json.dumps(plan, indent=2, sort_keys=True) + "\n", encoding="utf-8")
+    plan["playback_plan_path"] = str(destination)
+    return plan
+
+
 def write_retrieval_run_index(
     runs_dir: str | Path,
     *,
@@ -190,9 +238,145 @@ def materialize_top_ranked_candidates(results_path: str | Path) -> list[dict[str
                 "duration_seconds": audio_chunk.get("duration_seconds"),
                 "start_policy": playback_asset.get("start_policy"),
                 "loop_policy": playback_asset.get("loop_policy"),
+                **_materialized_master_paths(playback_asset),
             }
         )
     return materialized
+
+
+def _materialized_master_paths(playback_asset: dict[str, Any]) -> dict[str, Any]:
+    values: dict[str, Any] = {}
+    for field in MASTER_AUDIO_PATH_FIELDS:
+        if playback_asset.get(field):
+            values[field] = playback_asset[field]
+    if playback_asset.get("master_path"):
+        values["master_audio_path"] = playback_asset["master_path"]
+    if playback_asset.get("runtime_path"):
+        values["runtime_audio_path"] = playback_asset["runtime_path"]
+    return values
+
+
+def _build_playback_plan_entry(
+    candidate: Any,
+    *,
+    sequence: int,
+    record_path: Path,
+) -> dict[str, Any]:
+    if not isinstance(candidate, dict):
+        return {
+            "sequence": sequence,
+            "query_record_id": None,
+            "span_id": None,
+            "status": "invalid_candidate_summary",
+            "playable": False,
+        }
+
+    chunk_path = candidate.get("audio_chunk_path")
+    master_path, source_field = _candidate_master_path(candidate)
+    entry = {
+        "sequence": sequence,
+        "query_record_id": candidate.get("query_record_id"),
+        "span_id": candidate.get("span_id"),
+        "status": "playable",
+        "playable": True,
+        "asset_id": candidate.get("asset_id"),
+        "master_audio_path": master_path,
+        "master_audio_path_source": source_field,
+        "start_seconds": candidate.get("start_seconds"),
+        "start_policy": candidate.get("start_policy"),
+        "loop_policy": candidate.get("loop_policy"),
+        "chunk_id": candidate.get("chunk_id"),
+        "chunk_path": chunk_path,
+        "rank": candidate.get("rank"),
+        "score": candidate.get("score"),
+    }
+    if not candidate.get("asset_id"):
+        entry["status"] = candidate.get("status") or "no_top_candidate"
+        entry["playable"] = False
+    elif not master_path:
+        entry["status"] = "missing_master_path"
+        entry["playable"] = False
+    else:
+        resolved_master = _resolve_record_path(master_path, record_path)
+        entry["master_audio_path"] = str(resolved_master)
+        if not resolved_master.exists():
+            entry["status"] = "missing_master_file"
+            entry["playable"] = False
+    return entry
+
+
+def _candidate_master_path(candidate: dict[str, Any]) -> tuple[str | None, str | None]:
+    chunk_path = candidate.get("audio_chunk_path")
+    for field in MASTER_AUDIO_PATH_FIELDS:
+        value = candidate.get(field)
+        if value:
+            return str(value), field
+    asset_path = candidate.get("asset_path")
+    if asset_path and not _is_chunk_path(asset_path, chunk_path, candidate.get("chunk_id")):
+        return str(asset_path), "asset_path"
+    derived = _derive_sounds_v1_master_path(chunk_path or asset_path)
+    if derived:
+        return str(derived), "sounds_v1_chunk_path"
+    return None, None
+
+
+def _derive_sounds_v1_master_path(path_value: Any) -> Path | None:
+    if not path_value:
+        return None
+    path = Path(str(path_value))
+    parts = path.parts
+    lowered = [part.casefold() for part in parts]
+    try:
+        run_index = lowered.index(SOUNDS_V1_CORPUS_NAME)
+        corpus_index = lowered.index("corpus", run_index + 1)
+        chunks_index = lowered.index("chunks", corpus_index + 1)
+    except ValueError:
+        return None
+    if chunks_index <= corpus_index:
+        return None
+
+    stem = CHUNK_INDEX_SUFFIX_RE.sub("", path.stem)
+    if stem == path.stem:
+        return None
+    run_root = Path(*parts[: run_index + 1])
+    return run_root / "prepared" / "masters" / f"{stem}{path.suffix}"
+
+
+def _is_chunk_path(
+    path_value: Any,
+    chunk_path: Any = None,
+    chunk_id: Any = None,
+) -> bool:
+    if not path_value:
+        return False
+    path_text = str(path_value)
+    if chunk_path and Path(path_text) == Path(str(chunk_path)):
+        return True
+    parts = {part.casefold() for part in Path(path_text).parts}
+    if "chunks" in parts:
+        return True
+    if chunk_id and Path(path_text).stem == str(chunk_id):
+        return True
+    return False
+
+
+def _playback_plan_summary(entries: list[dict[str, Any]]) -> dict[str, int]:
+    total = len(entries)
+    playable = sum(1 for entry in entries if entry.get("playable"))
+    missing_master_path = sum(1 for entry in entries if entry.get("status") == "missing_master_path")
+    missing_master_file = sum(1 for entry in entries if entry.get("status") == "missing_master_file")
+    no_top_candidate = sum(
+        1
+        for entry in entries
+        if entry.get("status") not in {"playable", "missing_master_path", "missing_master_file"}
+    )
+    return {
+        "total": total,
+        "playable": playable,
+        "missing_master_path": missing_master_path,
+        "missing_master_file": missing_master_file,
+        "no_top_candidate": no_top_candidate,
+    }
 
 
 def _summarize_retrieval_run(record_path: Path, runs_dir: Path) -> dict[str, Any]:

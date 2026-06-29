@@ -7,13 +7,15 @@ positions, resolves EPUB CFIs through Calibre helpers, prepares text-block
 timelines, inspects how a live CFI maps back to book text, exports compact
 manual audio-intent query records, exports deterministic span placeholders for
 later query authoring, generates local audio-intent query records from those
-placeholders, and shells out to `music-retrieval-lab` for retrieval packages.
+placeholders, shells out to `music-retrieval-lab` for retrieval packages, and
+builds playback-plan artifacts from stored retrieval runs.
 
-Retrieval, embedding indexes, candidate ranking, review HTML, and playback are
-owned by `music-retrieval-lab` or later artifacts. bkpj2's near-term role is to
-produce book/span/query provenance, invoke the lab as an external command, and
-store retrieval-run records that point to lab packages and materialize the top
-candidate per span by default.
+Retrieval, embedding indexes, candidate ranking, review HTML, and audio output
+are owned by `music-retrieval-lab` or later artifacts. bkpj2's near-term role is
+to produce book/span/query provenance, invoke the lab as an external command,
+store retrieval-run records that point to lab packages, materialize the top
+candidate per span by default, and derive small playback plans that keep chunk
+evidence separate from normalized master/runtime audio paths.
 
 ## Setup
 
@@ -99,6 +101,14 @@ List retrieval runs for an imported book and refresh the small per-book index:
 .\.venv\Scripts\python.exe main.py list-retrieval-runs "Book Title" --json
 ```
 
+Build or inspect a playback plan for one retrieval run without starting audio:
+
+```powershell
+.\.venv\Scripts\python.exe main.py build-playback-plan .\data\books\5\retrieval_runs\run_001\retrieval_run.json
+.\.venv\Scripts\python.exe main.py build-playback-plan .\data\books\5\retrieval_runs\run_001\retrieval_run.json --verbose
+.\.venv\Scripts\python.exe main.py build-playback-plan .\data\books\5\retrieval_runs\run_001\retrieval_run.json --json
+```
+
 Capture or check CFI fixtures:
 
 ```powershell
@@ -148,6 +158,12 @@ Main local artifacts:
 - `data/books/<calibre_book_id>/retrieval_runs/retrieval_run_index.json`: a
   scan-derived run index with package paths, missing-file checks, and top
   candidate coverage without duplicating lab candidate rankings.
+- `data/books/<calibre_book_id>/retrieval_runs/<run_id>/playback_plan.json`: a
+  derived per-span playback plan that points playable entries at normalized
+  master/runtime audio files and keeps chunk paths as retrieval evidence only.
+  When explicit master paths are absent, the current local fallback derives
+  `sounds_v1` masters from chunk paths under
+  `...\sounds_v1\corpus\<backend>\chunks\`.
 - `data/cfi_fixtures/*.json`: captured live CFI resolver fixtures.
 
 The query handoff shape is defined in [docs/SCHEMAS.md](docs/SCHEMAS.md). The

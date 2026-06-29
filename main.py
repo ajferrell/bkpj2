@@ -53,6 +53,7 @@ from src.query_export import (
     query_records_path,
 )
 from src.retrieval_run import (
+    build_playback_plan,
     retrieval_runs_dir,
     run_retrieval_audio,
     write_retrieval_run_index,
@@ -536,6 +537,31 @@ def cmd_list_retrieval_runs(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_build_playback_plan(args: argparse.Namespace) -> int:
+    plan = build_playback_plan(args.retrieval_run, output_path=args.out)
+    if args.json:
+        print(json.dumps(plan, indent=2, ensure_ascii=False))
+        return 0
+
+    summary = plan["summary"]
+    print(f"Playback plan: {plan['playback_plan_path']}")
+    print(f"Retrieval run: {plan['retrieval_run_record_path']}")
+    print(
+        f"Entries: {summary['total']} | playable={summary['playable']} | "
+        f"missing_master_path={summary['missing_master_path']} | "
+        f"missing_master_file={summary['missing_master_file']}"
+    )
+    if args.verbose:
+        for entry in plan["entries"]:
+            print(
+                f"  {entry.get('sequence')}: span={entry.get('span_id')} "
+                f"query={entry.get('query_record_id')} status={entry.get('status')} "
+                f"master={entry.get('master_audio_path') or '(none)'} "
+                f"chunk={entry.get('chunk_path') or '(none)'}"
+            )
+    return 0
+
+
 def _print_retrieval_verbose(record: dict[str, Any]) -> None:
     print("\nLab command:")
     print(record["lab_command"])
@@ -898,6 +924,13 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--json", action="store_true", help="Print the refreshed run index as JSON")
     p.add_argument("--verbose", action="store_true", help="Print package paths and per-span top-candidate status")
     p.set_defaults(func=cmd_list_retrieval_runs)
+
+    p = sub.add_parser("build-playback-plan", help="Build a playback plan from one retrieval-run record")
+    p.add_argument("retrieval_run", help="Path to a retrieval_run.json file")
+    p.add_argument("--out", help="Output playback_plan.json path; defaults next to retrieval_run.json")
+    p.add_argument("--json", action="store_true", help="Print the written playback plan as JSON")
+    p.add_argument("--verbose", action="store_true", help="Print per-span playback plan status")
+    p.set_defaults(func=cmd_build_playback_plan)
 
     return parser
 
