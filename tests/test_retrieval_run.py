@@ -2,6 +2,8 @@ import json
 import sys
 
 from main import build_parser
+from src.anchors import prepare_book_timeline
+from src.calibre_native import save_manifest
 from src.retrieval_run import (
     build_playback_plan,
     materialize_top_ranked_candidates,
@@ -472,6 +474,98 @@ def test_build_playback_plan_cli_writes_plan_and_reports_summary(tmp_path, capsy
     assert (run_dir / "playback_plan.json").exists()
 
 
+def test_run_book_audio_pipeline_cli_writes_artifact_chain(tmp_path, capsys):
+    lab_project = _write_fake_lab_project(tmp_path)
+    data_dir = tmp_path / "data"
+    _write_prepared_query_book(data_dir, tmp_path)
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "run-book-audio-pipeline",
+            "42",
+            "--run-id",
+            "run_pipeline_test",
+            "--provider",
+            "fake",
+            "--retrieval-profile",
+            "fake",
+            "--lab-project",
+            str(lab_project),
+            "--lab-python",
+            sys.executable,
+            "--max-spans",
+            "1",
+            "--target-words",
+            "14",
+            "--min-words",
+            "8",
+            "--max-words",
+            "20",
+        ]
+    )
+
+    assert args.func(args) == 0
+
+    book_dir = data_dir / "books" / "42"
+    run_dir = book_dir / "retrieval_runs" / "run_pipeline_test"
+    assert (book_dir / "query_records.needs_query.jsonl").exists()
+    assert (book_dir / "query_records.generated.fake.fake-audio-intent-v1.jsonl").exists()
+    assert (run_dir / "retrieval_run.json").exists()
+    assert (run_dir / "playback_plan.json").exists()
+    plan = json.loads((run_dir / "playback_plan.json").read_text(encoding="utf-8"))
+    assert plan["entries"][0]["query_record_id"].startswith("book-42-")
+    captured = capsys.readouterr()
+    assert "Book audio pipeline complete" in captured.out
+    assert "Generated query records:" in captured.out
+    assert "Retrieval run record:" in captured.out
+    assert "Follow live:" in captured.out
+    assert "follow-live-audio 42" in captured.out
+
+
+def test_run_book_audio_pipeline_refuses_existing_run_without_reuse(tmp_path):
+    lab_project = _write_fake_lab_project(tmp_path)
+    data_dir = tmp_path / "data"
+    _write_prepared_query_book(data_dir, tmp_path)
+    run_dir = data_dir / "books" / "42" / "retrieval_runs" / "run_exists"
+    run_dir.mkdir(parents=True)
+    parser = build_parser()
+    args = parser.parse_args(
+        [
+            "--data-dir",
+            str(data_dir),
+            "run-book-audio-pipeline",
+            "42",
+            "--run-id",
+            "run_exists",
+            "--provider",
+            "fake",
+            "--retrieval-profile",
+            "fake",
+            "--lab-project",
+            str(lab_project),
+            "--lab-python",
+            sys.executable,
+            "--max-spans",
+            "1",
+            "--target-words",
+            "14",
+            "--min-words",
+            "8",
+            "--max-words",
+            "20",
+        ]
+    )
+
+    try:
+        args.func(args)
+    except FileExistsError as exc:
+        assert "Retrieval run directory already exists" in str(exc)
+    else:
+        raise AssertionError("expected FileExistsError")
+
+
 def _write_fake_lab_project(tmp_path):
     lab_project = tmp_path / "fake_lab"
     package = lab_project / "music_retrieval_lab"
@@ -499,9 +593,16 @@ def main() -> int:
     args = parser.parse_args()
     out = Path(args.out)
     out.mkdir(parents=True)
+    records = [
+        json.loads(line)
+        for line in Path(args.query_records).read_text(encoding="utf-8").splitlines()
+        if line.strip()
+    ]
+    source = records[0] if records else {}
+    span = source.get("span") or {}
     row = {
-        "query_record_id": "book-1-span-a-q1",
-        "span_id": "span-a",
+        "query_record_id": source.get("record_id") or "book-1-span-a-q1",
+        "span_id": span.get("span_id") or "span-a",
         "status": "ok",
         "candidates": [
             {
@@ -593,3 +694,48 @@ def _write_manifest(data_dir):
         json.dumps(manifest) + "\n",
         encoding="utf-8",
     )
+
+
+def _write_prepared_query_book(data_dir, tmp_path):
+    epub = tmp_path / "book-42.epub"
+    epub.write_bytes(b"fake epub")
+    book = {
+        "calibre_book_id": 42,
+        "calibre_uuid": "uuid-42",
+        "title": "Test Book",
+        "authors": ["Test Author"],
+        "library_path": str(tmp_path),
+        "calibre_path": "Test Author/Test Book",
+        "formats": {"EPUB": str(epub)},
+        "preferred_epub_path": str(epub),
+        "annots_key": "abc.json",
+        "prepared": True,
+    }
+    save_manifest({"schema_version": 1, "libraries": [str(tmp_path)], "books": [book]}, data_dir=data_dir)
+
+    def extractor(epub_path):
+        assert epub_path == str(epub)
+        return [
+            {
+                "spine_index": 0,
+                "href": "chapter.xhtml",
+                "text": "\n\n".join(
+                    [
+                        "A cold quiet room waits beneath the house.",
+                        "The family whispers while distant thunder grows.",
+                        "A locked door rattles once and then falls still.",
+                        "Someone descends the stairs with a covered lamp.",
+                    ]
+                ),
+            }
+        ]
+
+    prepare_book_timeline(
+        book,
+        data_dir=data_dir,
+        target_words=8,
+        min_words=4,
+        debug_text=True,
+        spine_extractor=extractor,
+    )
+    return book

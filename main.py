@@ -5,6 +5,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
@@ -639,6 +640,151 @@ def cmd_follow_live_audio(args: argparse.Namespace) -> int:
     return 0 if events else 1
 
 
+def cmd_run_book_audio_pipeline(args: argparse.Namespace) -> int:
+    book = find_book(args.query, args.data_dir)
+    book_id = book["calibre_book_id"]
+    book_dir = Path(args.data_dir) / "books" / str(book_id)
+
+    timeline_file = timeline_path(args.data_dir, book_id)
+    if args.overwrite_timeline or not timeline_file.exists():
+        prepared_path = prepare_book_timeline(
+            book,
+            data_dir=args.data_dir,
+            target_words=args.prepare_target_words,
+            min_words=args.prepare_min_words,
+            debug_text=args.debug_text,
+        )
+        timeline_status = "written"
+    else:
+        prepared_path = timeline_file
+        timeline_status = "reused"
+
+    timeline = load_timeline_with_sidecars(args.data_dir, book_id)
+    for warning in drift_warnings_for_export(book, timeline):
+        print(f"Warning: {warning}", file=sys.stderr)
+
+    needs_query_path = (
+        Path(args.needs_query_path)
+        if args.needs_query_path
+        else book_dir / "query_records.needs_query.jsonl"
+    )
+    if needs_query_path.exists() and not args.overwrite_needs_query:
+        needs_query_status = "reused"
+    else:
+        needs_query_path.parent.mkdir(parents=True, exist_ok=True)
+        if args.overwrite_needs_query:
+            needs_query_path.write_text("", encoding="utf-8")
+        text_blocks = load_text_blocks_for_export(args.data_dir, book, timeline=timeline)
+        spans = build_batch_query_spans(
+            book=book,
+            timeline=timeline,
+            text_blocks=text_blocks,
+            spine_index=args.spine_index,
+            href=args.href,
+            target_words=args.target_words,
+            min_words=args.min_words,
+            max_words=args.max_words,
+            max_spans=args.max_spans,
+        )
+        for span in spans:
+            record = build_query_record(
+                book=book,
+                timeline=timeline,
+                span=span,
+                query_text="",
+                query_mode="needs_query",
+                generation_method="batch_placeholder_v1",
+                review_status="needs_query",
+                allow_empty_query=True,
+            )
+            append_query_record(needs_query_path, record)
+        needs_query_status = f"written ({len(spans)} records)"
+
+    generator = _query_generator_from_args(args)
+    generated_path = (
+        Path(args.generated_query_path)
+        if args.generated_query_path
+        else book_dir
+        / (
+            "query_records.generated."
+            f"{_safe_artifact_token(generator.provider)}."
+            f"{_safe_artifact_token(generator.model_id)}.jsonl"
+        )
+    )
+    if generated_path.exists() and not args.overwrite_generated:
+        generated_status = "reused"
+    else:
+        summary = generate_query_records(
+            input_path=needs_query_path,
+            output_path=generated_path,
+            generator=generator,
+            prompt_version=args.prompt_version,
+            generation_method=args.generation_method,
+            cache_path=args.cache,
+            errors_path=args.errors,
+            overwrite=args.overwrite_generated,
+            limit=args.max_spans,
+        )
+        generated_status = (
+            f"written ({summary['generated_count']} records, "
+            f"{summary['cached_count']} cache hits, {summary['failed_count']} failures)"
+        )
+        if summary["failed_count"]:
+            print(f"Generation errors: {summary['errors_path']}", file=sys.stderr)
+            return 1
+
+    run_id = args.run_id or _timestamp_run_id()
+    run_dir = Path(args.run_dir) if args.run_dir else retrieval_runs_dir(args.data_dir, book_id) / run_id
+    retrieval_run_record = run_dir / "retrieval_run.json"
+    if run_dir.exists():
+        if not args.reuse_retrieval_run:
+            raise FileExistsError(f"Retrieval run directory already exists: {run_dir}")
+        if not retrieval_run_record.exists():
+            raise FileNotFoundError(f"Retrieval run record does not exist: {retrieval_run_record}")
+        retrieval_status = "reused"
+    else:
+        record = run_retrieval_audio(
+            query_records_path=generated_path,
+            retrieval_profile=args.retrieval_profile,
+            profile_config_path=args.profile_config,
+            output_dir=run_dir,
+            lab_project=args.lab_project,
+            lab_executable=args.lab_executable,
+            lab_python=args.lab_python,
+            mode=args.mode,
+            limit=args.retrieval_limit,
+            candidate_strategy=args.candidate_strategy,
+        )
+        retrieval_run_record = Path(record["retrieval_run_record_path"])
+        retrieval_status = f"written (exit {record['exit_status']})"
+        if args.verbose:
+            _print_retrieval_verbose(record)
+        if record["exit_status"] != 0:
+            print(f"Retrieval failed: {retrieval_run_record}", file=sys.stderr)
+            return int(record["exit_status"])
+
+    playback_plan_file = Path(args.playback_plan_path) if args.playback_plan_path else run_dir / "playback_plan.json"
+    if playback_plan_file.exists() and not args.overwrite_playback_plan:
+        playback_status = "reused"
+    else:
+        plan = build_playback_plan(retrieval_run_record, output_path=playback_plan_file)
+        playback_plan_file = Path(plan["playback_plan_path"])
+        playback_status = (
+            f"written ({plan['summary']['playable']}/{plan['summary']['total']} playable)"
+        )
+
+    follow_command = _follow_live_audio_command(args.data_dir, book_id, playback_plan_file)
+    print("Book audio pipeline complete")
+    print(f"Book: {book.get('title')} ({book_id})")
+    print(f"Timeline: {prepared_path} [{timeline_status}]")
+    print(f"Needs-query records: {needs_query_path} [{needs_query_status}]")
+    print(f"Generated query records: {generated_path} [{generated_status}]")
+    print(f"Retrieval run record: {retrieval_run_record} [{retrieval_status}]")
+    print(f"Playback plan: {playback_plan_file} [{playback_status}]")
+    print(f"Follow live: {follow_command}")
+    return 0
+
+
 def _print_retrieval_verbose(record: dict[str, Any]) -> None:
     print("\nLab command:")
     print(record["lab_command"])
@@ -744,6 +890,41 @@ def _default_generated_output(input_path: str | Path) -> Path:
     if path.name == "query_records.needs_query.jsonl":
         return path.with_name("query_records.generated.jsonl")
     return path.with_suffix(path.suffix + ".generated.jsonl")
+
+
+def _timestamp_run_id() -> str:
+    return "run_" + datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def _safe_artifact_token(value: str | None) -> str:
+    token = "".join(
+        ch if ch.isalnum() or ch in ("-", "_") else "-"
+        for ch in (value or "unknown").lower()
+    )
+    return "-".join(part for part in token.split("-") if part) or "unknown"
+
+
+def _follow_live_audio_command(data_dir: str, book_id: int | str, playback_plan_file: Path) -> str:
+    return " ".join(
+        [
+            ".\\.venv\\Scripts\\python.exe",
+            "main.py",
+            "--data-dir",
+            _quote_cli_arg(str(data_dir)),
+            "follow-live-audio",
+            str(book_id),
+            _quote_cli_arg(str(playback_plan_file)),
+            "--dry-run",
+            "--once",
+            "--verbose",
+        ]
+    )
+
+
+def _quote_cli_arg(value: str) -> str:
+    if not value or any(ch.isspace() for ch in value):
+        return '"' + value.replace('"', '\\"') + '"'
+    return value
 
 
 def _href_for_spine(timeline: dict[str, Any], spine_index: int) -> str | None:
@@ -1096,6 +1277,78 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--spine-index", type=int, help="Manual resolved spine index for dry-run smoke tests")
     p.add_argument("--local-char-offset", type=int, help="Manual resolved local character offset for dry-run smoke tests")
     p.set_defaults(func=cmd_follow_live_audio)
+
+    p = sub.add_parser("run-book-audio-pipeline", help="Run or reuse the standard book-to-audio artifact chain")
+    p.add_argument("query", help="Title, author, Calibre id, or UUID fragment")
+    p.add_argument("--run-id", help="Retrieval run id; defaults to a UTC timestamp")
+    p.add_argument("--run-dir", help="Explicit retrieval run directory")
+    p.add_argument("--needs-query-path", help="Existing or output needs-query JSONL path")
+    p.add_argument("--generated-query-path", help="Existing or output generated-query JSONL path")
+    p.add_argument("--playback-plan-path", help="Playback-plan output path")
+    p.add_argument("--overwrite-timeline", action="store_true", help="Rebuild timeline/source-unit artifacts")
+    p.add_argument(
+        "--overwrite-needs-query",
+        action="store_true",
+        help="Overwrite needs-query records instead of reusing them",
+    )
+    p.add_argument(
+        "--overwrite-generated",
+        action="store_true",
+        help="Overwrite generated query records instead of reusing them",
+    )
+    p.add_argument(
+        "--overwrite-playback-plan",
+        action="store_true",
+        help="Overwrite playback_plan.json instead of reusing it",
+    )
+    p.add_argument("--reuse-retrieval-run", action="store_true", help="Reuse an existing retrieval run directory")
+    p.add_argument("--debug-text", action="store_true", help="Write inspect_text.json when preparing the book")
+    p.add_argument("--prepare-target-words", type=int, default=350, help="prepare-book target words")
+    p.add_argument("--prepare-min-words", type=int, default=180, help="prepare-book minimum words")
+    p.add_argument("--spine-index", type=int, help="Only export spans from one prepared spine index")
+    p.add_argument("--href", help="Only export spans from one prepared spine href/chapter")
+    p.add_argument("--max-spans", type=int, help="Limit exported/generated query records for smoke runs")
+    p.add_argument("--target-words", type=int, default=800, help="Preferred query span size")
+    p.add_argument("--min-words", type=int, default=500, help="Minimum query span size before stopping at max")
+    p.add_argument("--max-words", type=int, default=1200, help="Maximum query span size")
+    p.add_argument(
+        "--provider",
+        choices=["fake", "local-command", "ollama"],
+        default="local-command",
+        help="Generation adapter to use",
+    )
+    p.add_argument("--command", help="Local command executable; reads prompt on stdin and writes query text")
+    p.add_argument("--command-arg", action="append", default=[], help="Argument passed to --command")
+    p.add_argument("--model", help="Model/provider id to store in generated query records")
+    p.add_argument("--ollama-url", default="http://localhost:11434", help="Ollama base URL for --provider ollama")
+    p.add_argument("--timeout", type=float, default=60.0, help="Per-record provider timeout in seconds")
+    p.add_argument("--temperature", type=float, default=0.2, help="Ollama generation temperature")
+    p.add_argument("--num-predict", type=int, default=48, help="Ollama maximum generated tokens")
+    p.add_argument("--keep-alive", help="Optional Ollama keep_alive duration")
+    p.add_argument("--prompt-version", default="audio_intent_v1")
+    p.add_argument("--generation-method", default="local_model_audio_intent_v1")
+    p.add_argument("--cache", help="Generation cache JSON path")
+    p.add_argument("--errors", help="Generation error JSONL sidecar path")
+    p.add_argument("--retrieval-profile", required=True, help="Lab retrieval profile name")
+    p.add_argument("--profile-config", help="Lab retrieval profile YAML path")
+    p.add_argument("--lab-project", help="music-retrieval-lab checkout to use as the subprocess working directory")
+    p.add_argument("--lab-executable", default="music-lab", help="music-lab executable to run")
+    p.add_argument("--lab-python", help="Python executable for `-m music_retrieval_lab.cli`")
+    p.add_argument(
+        "--mode",
+        choices=["package-only", "review-html"],
+        default="package-only",
+        help="Lab output mode",
+    )
+    p.add_argument("--retrieval-limit", type=int, help="Review HTML row limit when --mode review-html is used")
+    p.add_argument(
+        "--candidate-strategy",
+        choices=["top_ranked"],
+        default="top_ranked",
+        help="How bkpj2 materializes candidates from the lab package",
+    )
+    p.add_argument("--verbose", action="store_true", help="Print captured lab command, stdout, and stderr")
+    p.set_defaults(func=cmd_run_book_audio_pipeline)
 
     return parser
 

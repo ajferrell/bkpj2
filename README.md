@@ -91,6 +91,21 @@ The Ollama provider expects the operator to install Ollama separately, run the
 local service, and pull the requested model first. bkpj2 does not install
 Ollama or download models.
 
+Run the standard book-to-audio artifact pipeline in one command:
+
+```powershell
+.\.venv\Scripts\python.exe main.py run-book-audio-pipeline 5 --run-id run_ollama_001 --provider ollama --model qwen3:4b-instruct --retrieval-profile local_fused_v1 --profile-config C:\dev\music-retrieval-lab\configs\retrieval_profile.yml --lab-project C:\dev\music-retrieval-lab --lab-python C:\dev\music-retrieval-lab\.venv\Scripts\python.exe --max-spans 3 --verbose
+.\.venv\Scripts\python.exe main.py run-book-audio-pipeline 5 --run-id run_ollama_001 --provider ollama --model qwen3:4b-instruct --retrieval-profile local_fused_v1 --profile-config C:\dev\music-retrieval-lab\configs\retrieval_profile.yml --lab-project C:\dev\music-retrieval-lab --lab-python C:\dev\music-retrieval-lab\.venv\Scripts\python.exe --reuse-retrieval-run
+```
+
+The pipeline prepares or reuses `timeline.json` and `source_units.json`, writes
+or reuses `query_records.needs_query.jsonl`, writes or reuses a
+provider/model-named generated query JSONL, runs `retrieve-audio`, builds
+`playback_plan.json`, and prints a ready-to-run `follow-live-audio` command.
+It reuses existing JSON artifacts by default and refuses to overwrite an
+existing retrieval run directory unless `--reuse-retrieval-run` is provided.
+Use the individual commands below when you need to inspect or rerun one stage.
+
 Run a lab retrieval package and write a bkpj2 retrieval-run pointer:
 
 ```powershell
