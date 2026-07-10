@@ -83,9 +83,15 @@ Generate local audio-intent query records from `needs_query` placeholders:
 
 ```powershell
 .\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider ollama --model qwen3:4b-instruct --ollama-url http://localhost:11434 --limit 3 --overwrite
-.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider local-command --command C:\path\to\local-query-generator.exe --prompt-version audio_intent_v1
+.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.scene.jsonl --provider ollama --model qwen3:4b-instruct --prompt-version audio_intent_scene_v1 --limit 5 --overwrite
+.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.sparse.jsonl --provider ollama --model qwen3:4b-instruct --prompt-version audio_intent_sparse_v1 --limit 5 --overwrite
+.\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.legacy.jsonl --provider local-command --command C:\path\to\local-query-generator.exe --prompt-version audio_intent_v1
 .\.venv\Scripts\python.exe main.py generate-queries --input .\query_records.needs_query.jsonl --out .\query_records.generated.jsonl --provider fake
 ```
+
+`audio_intent_scene_v1` is the default prompt. It frames the output as an
+audio-embedding search phrase. Use `audio_intent_v1` for the shorter no-menu scene prompt, and
+`audio_intent_sparse_v1` for the checklist-heavy skill-style prompt.
 
 The Ollama provider expects the operator to install Ollama separately, run the
 local service, and pull the requested model first. bkpj2 does not install

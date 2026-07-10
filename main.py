@@ -42,6 +42,7 @@ from src.cfi_fixtures import (
     timestamp_name,
 )
 from src.query_export import (
+    DEFAULT_PROMPT_VERSION,
     FakeQueryGenerator,
     LocalCommandQueryGenerator,
     OllamaQueryGenerator,
@@ -1204,7 +1205,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.2, help="Ollama generation temperature")
     p.add_argument("--num-predict", type=int, default=48, help="Ollama maximum generated tokens")
     p.add_argument("--keep-alive", help="Optional Ollama keep_alive duration")
-    p.add_argument("--prompt-version", default="audio_intent_v1")
+    p.add_argument("--prompt-version", default=DEFAULT_PROMPT_VERSION)
     p.add_argument("--generation-method", default="local_model_audio_intent_v1")
     p.add_argument("--cache", help="Generation cache JSON path")
     p.add_argument("--errors", help="Generation error JSONL sidecar path")
@@ -1325,7 +1326,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--temperature", type=float, default=0.2, help="Ollama generation temperature")
     p.add_argument("--num-predict", type=int, default=48, help="Ollama maximum generated tokens")
     p.add_argument("--keep-alive", help="Optional Ollama keep_alive duration")
-    p.add_argument("--prompt-version", default="audio_intent_v1")
+    p.add_argument("--prompt-version", default=DEFAULT_PROMPT_VERSION)
     p.add_argument("--generation-method", default="local_model_audio_intent_v1")
     p.add_argument("--cache", help="Generation cache JSON path")
     p.add_argument("--errors", help="Generation error JSONL sidecar path")

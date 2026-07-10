@@ -11,6 +11,7 @@ from src.anchors import (
 )
 from src.calibre_native import save_manifest
 from src.query_export import (
+    DEFAULT_PROMPT_VERSION,
     FakeQueryGenerator,
     OllamaQueryGenerator,
     append_query_record,
@@ -382,10 +383,73 @@ def test_generation_prompt_matches_manual_audio_intent_shape(tmp_path):
 
     prompt = build_generation_prompt(source, "audio_intent_v1")
 
-    assert "Compress the passage into one audio-intent query." in prompt
-    assert "Return one comma-separated phrase, 12-24 words." in prompt
-    assert "No proper nouns, no character names, no plot summary, no labels, no full sentence." in prompt
+    assert "Write one background-music or ambience search query" in prompt
+    assert "do not copy examples, choose from a menu" in prompt
+    assert "Replace character names and proper nouns with roles or situations." in prompt
     assert "Return only the query phrase." in prompt
+
+
+def test_generation_prompt_scene_version_is_scene_first(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=build_batch_query_spans(
+            book=book,
+            timeline=timeline,
+            text_blocks=blocks,
+            max_spans=1,
+            target_words=14,
+            min_words=8,
+            max_words=20,
+        )[0],
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+
+    prompt = build_generation_prompt(source, DEFAULT_PROMPT_VERSION)
+
+    assert "You write search phrases for an audio embedding model." in prompt
+    assert "what is physically happening" in prompt
+    assert "Style examples:" not in prompt
+    assert "[scene/action], [setting/object texture], [social or emotional pressure]" in prompt
+    assert "Return only one short comma-separated phrase." in prompt
+
+
+def test_generation_prompt_sparse_version_is_comparison_option(tmp_path):
+    book, data_dir = prepare_fake_book(tmp_path)
+    timeline = load_timeline(data_dir, book["calibre_book_id"])
+    blocks = load_text_blocks_for_export(data_dir, book, timeline=timeline)
+    source = build_query_record(
+        book=book,
+        timeline=timeline,
+        span=build_batch_query_spans(
+            book=book,
+            timeline=timeline,
+            text_blocks=blocks,
+            max_spans=1,
+            target_words=14,
+            min_words=8,
+            max_words=20,
+        )[0],
+        query_text="",
+        query_mode="needs_query",
+        generation_method="batch_placeholder_v1",
+        review_status="needs_query",
+        allow_empty_query=True,
+    )
+
+    prompt = build_generation_prompt(source, "audio_intent_sparse_v1")
+
+    assert "# Audio Intent Query Writer" in prompt
+    assert "## Internal Checklist" in prompt
+    assert "Did you avoid copying any instruction wording into the answer?" in prompt
+    assert "Infer the larger scene function they support." in prompt
 
 
 def test_generate_queries_writes_generated_records_and_cache(tmp_path):
@@ -462,6 +526,8 @@ def test_generate_queries_cli_ollama_posts_request_and_uses_cache(tmp_path, caps
                 "32",
                 "--keep-alive",
                 "5m",
+                "--prompt-version",
+                "audio_intent_v1",
                 "--overwrite",
             ]
         )
@@ -481,6 +547,8 @@ def test_generate_queries_cli_ollama_posts_request_and_uses_cache(tmp_path, caps
                 base_url,
                 "--model",
                 "qwen3:4b-instruct",
+                "--prompt-version",
+                "audio_intent_v1",
                 "--overwrite",
             ]
         )
@@ -498,8 +566,8 @@ def test_generate_queries_cli_ollama_posts_request_and_uses_cache(tmp_path, caps
     assert payload["think"] is False
     assert payload["options"] == {"temperature": 0.15, "num_predict": 32}
     assert payload["keep_alive"] == "5m"
-    assert "Return one comma-separated phrase, 12-24 words." in payload["prompt"]
-    assert "No proper nouns, no character names, no plot summary, no labels, no full sentence." in payload["prompt"]
+    assert "do not copy examples, choose from a menu" in payload["prompt"]
+    assert "Replace character names and proper nouns with roles or situations." in payload["prompt"]
     records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
     assert len(records) == 1
     assert records[0]["query"]["provider"] == "ollama"
@@ -507,6 +575,43 @@ def test_generate_queries_cli_ollama_posts_request_and_uses_cache(tmp_path, caps
     assert records[0]["query"]["text"] == "tense sparse strings; slow pulse; no vocals"
     assert "Generated query records: 1" in first.out
     assert "Cache hits: 1" in second.out
+
+
+def test_generate_queries_cli_defaults_to_scene_prompt(tmp_path):
+    _, _, input_path = write_needs_query_file(tmp_path)
+    output = tmp_path / "query_records.generated.jsonl"
+    server, base_url, requests = start_fake_ollama_server()
+    parser = build_parser()
+
+    try:
+        args = parser.parse_args(
+            [
+                "generate-queries",
+                "--input",
+                str(input_path),
+                "--out",
+                str(output),
+                "--provider",
+                "ollama",
+                "--ollama-url",
+                base_url,
+                "--model",
+                "qwen3:4b-instruct",
+                "--overwrite",
+            ]
+        )
+        assert args.func(args) == 0
+    finally:
+        server.shutdown()
+        server.server_close()
+
+    assert requests
+    assert f"Prompt version: {DEFAULT_PROMPT_VERSION}" in requests[0]["body"]["prompt"]
+    assert "You write search phrases for an audio embedding model." in requests[0]["body"]["prompt"]
+    assert "Style examples:" not in requests[0]["body"]["prompt"]
+    assert "[scene/action], [setting/object texture], [social or emotional pressure]" in requests[0]["body"]["prompt"]
+    records = [json.loads(line) for line in output.read_text(encoding="utf-8").splitlines()]
+    assert records[0]["query"]["prompt_version"] == DEFAULT_PROMPT_VERSION
 
 
 def test_ollama_generator_failure_is_written_to_error_sidecar(tmp_path):

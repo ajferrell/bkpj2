@@ -27,6 +27,12 @@ DEFAULT_RETRIEVAL_PROFILE = "local_audio_text_query"
 DEFAULT_EXCERPT_CHAR_LIMIT = 2200
 ALLOWED_QUERY_MODES = {"manual", "generated", "needs_query"}
 ALLOWED_REVIEW_STATUSES = {"needs_query", "unreviewed", "approved", "rejected"}
+DEFAULT_PROMPT_VERSION = "audio_intent_scene_v1"
+SUPPORTED_PROMPT_VERSIONS = {
+    "audio_intent_v1",
+    "audio_intent_scene_v1",
+    "audio_intent_sparse_v1",
+}
 FORBIDDEN_QUERY_RECORD_KEYS = {
     "candidate_rankings",
     "candidates",
@@ -468,18 +474,88 @@ def read_query_records(path: str | Path) -> list[dict[str, Any]]:
 
 
 def build_generation_prompt(record: dict[str, Any], prompt_version: str) -> str:
+    if prompt_version not in SUPPORTED_PROMPT_VERSIONS:
+        choices = ", ".join(sorted(SUPPORTED_PROMPT_VERSIONS))
+        raise ValueError(f"Unsupported prompt_version: {prompt_version}. Expected one of: {choices}")
     span = record.get("span") or {}
     book = record.get("book") or {}
+    if prompt_version == "audio_intent_v1":
+        instructions = [
+            "Write one background-music or ambience search query for this passage.",
+            "First infer the dramatic job of the scene in plain words.",
+            "Then add only the setting, pressure, motion, and emotional color needed to find matching audio.",
+            "Use the passage itself; do not copy examples, choose from a menu, or reuse canned scene labels.",
+            "Prefer broad, searchable music language over visible object lists or foley fragments.",
+            "Replace character names and proper nouns with roles or situations.",
+            "If the draft reads like a sentence, caption, plot summary, or prop inventory, rewrite it once before answering.",
+            "Return one comma-separated phrase, 10-18 words.",
+            "Return only the query phrase.",
+        ]
+    elif prompt_version == "audio_intent_sparse_v1":
+        instructions = [
+            "# Audio Intent Query Writer",
+            "",
+            "## Goal",
+            "Convert a fiction passage into a compact query for finding background music or ambience.",
+            "The query is not a caption, summary, or sound-design script.",
+            "It should help an audio retrieval model find tracks that feel appropriate while reading the scene.",
+            "",
+            "## Output",
+            "Return exactly one comma-separated phrase, 10-18 words. No explanation and no markdown.",
+            "",
+            "## Priority Order",
+            "1. Infer the larger dramatic situation from the passage.",
+            "2. Keep the setting only when it changes the sound a listener should hear.",
+            "3. Add pressure, pace, scale, and emotional direction.",
+            "4. Mention musical or ambience texture only when it follows from the passage.",
+            "",
+            "## Avoid",
+            "- Copying nouns just because they are visible in the excerpt.",
+            "- Inventing sound effects not needed for audio retrieval.",
+            "- Repeating generic ambience filler.",
+            "- Using proper nouns, character names, or place names unique to the book.",
+            "- Writing a full sentence or summarizing who did what.",
+            "",
+            "## Internal Checklist",
+            "- Would this query still work if the listener did not know the book?",
+            "- Does each phrase help choose music or ambience?",
+            "- Did you remove names and one-off props?",
+            "- Did you avoid copying any instruction wording into the answer?",
+            "",
+            "## Decision Rule",
+            "If the passage contains many concrete details, do not copy them.",
+            "Infer the larger scene function they support.",
+            "",
+            "Return only the query phrase.",
+        ]
+    else:
+        instructions = [
+            "You write search phrases for an audio embedding model.",
+            "",
+            "Given a fiction excerpt, write one compact phrase describing the instrumental background track or ambience that would fit the scene.",
+            "",
+            "Focus on:",
+            "- what is physically happening",
+            "- the place, weather, objects, or textures",
+            "- the emotional pressure",
+            "- implied sound, silence, rhythm, danger, motion, ritual, crowd, machinery, or violence",
+            "",
+            "Avoid:",
+            "- character names and proper nouns",
+            "- plot summary",
+            "- generic labels by themselves, such as \"fantasy music\", \"epic music\", \"sad music\", or \"dark ambience\"",
+            "- invented instruments unless the excerpt strongly implies them",
+            "- explanation or formatting labels",
+            "",
+            "Follow this pattern:",
+            "[scene/action], [setting/object texture], [social or emotional pressure], [threat/trajectory], and [final mood/audio cue]",
+            "",
+            "Return only one short comma-separated phrase.",
+        ]
     return "\n".join(
         [
             f"Prompt version: {prompt_version}",
-            "Compress the passage into one audio-intent query.",
-            "Return one comma-separated phrase, 12-24 words.",
-            "Preserve the strongest concrete sensory details and the dominant pressure of the moment.",
-            "Use words that would help find background music or ambience: material texture, physical space, threat level, pace, emotional weight, and sound character.",
-            "Do not describe who did what. Describe the atmosphere the listener should hear.",
-            "No proper nouns, no character names, no plot summary, no labels, no full sentence.",
-            "Return only the query phrase.",
+            *instructions,
             f"Book: {book.get('title') or ''}",
             f"Span id: {span.get('span_id') or ''}",
             f"Excerpt hash: {span.get('excerpt_hash') or ''}",
